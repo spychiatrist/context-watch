@@ -1,0 +1,6 @@
+{
+  "name": "context-watch",
+  "description": "context-watch, a Claude Code mod that watches the context size and usage meters and makes clear-and-restart one step",
+  "owner": { "name": "spychiatrist", "url": "https://github.com/spychiatrist" },
+  "plugins": [{ "name": "context-watch", "source": "./" }]
+}

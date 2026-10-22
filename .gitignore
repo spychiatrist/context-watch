@@ -1,0 +1,15 @@
+# Written by Claude Code when it loads the mod from a watched folder
+.claude-plugin/types/
+
+# Logs, state and caches
+*.log
+context-watch-said*.md
+.mcpb-cache/
+node_modules/
+
+# OS and editor files
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

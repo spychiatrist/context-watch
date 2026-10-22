@@ -1,0 +1,62 @@
+{
+  "name": "context-watch",
+  "version": "0.3.0",
+  "description": "Tells the model its context size and plan usage at each 100k and usage mark, logs it, and lets it compact or clear itself and carry on",
+  "author": {
+    "name": "spychiatrist",
+    "url": "https://github.com/spychiatrist"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/spychiatrist/context-watch",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "contextStep": {
+      "type": "number",
+      "title": "Context step (tokens)",
+      "description": "A notice each time the context passes a multiple of this many tokens.",
+      "default": 100000
+    },
+    "fiveHourMarks": {
+      "type": "string",
+      "title": "5-hour usage marks (%)",
+      "description": "Comma-separated percentages of the 5-hour usage window that raise a notice. Empty: none.",
+      "default": "50,80,95"
+    },
+    "weeklyMarks": {
+      "type": "string",
+      "title": "Weekly usage marks (%)",
+      "description": "Comma-separated percentages of the weekly usage window that raise a notice. Empty: none.",
+      "default": "50,75,90"
+    },
+    "statusLine": {
+      "type": "boolean",
+      "title": "Status line",
+      "description": "Show the context size and usage in the status line after each tool call.",
+      "default": true
+    },
+    "dataDir": {
+      "type": "string",
+      "title": "Data folder",
+      "description": "Where the log and the per-project files of last turns go. A leading ~ is your home folder.",
+      "default": "~/.claude"
+    },
+    "log": {
+      "type": "boolean",
+      "title": "Log",
+      "description": "Append each crossing, compaction and clear to context-watch.log in the data folder.",
+      "default": true
+    },
+    "logMaxBytes": {
+      "type": "number",
+      "title": "Log size cap (bytes)",
+      "description": "Past this size the log keeps its newer half.",
+      "default": 200000
+    },
+    "keepTurns": {
+      "type": "number",
+      "title": "Turns kept per project",
+      "description": "How many of the last turns' words are kept per project, to show again after a /clear. 0 turns this off.",
+      "default": 10
+    }
+  }
+}
