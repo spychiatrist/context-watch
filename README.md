@@ -37,6 +37,7 @@ context-watch helps with both halves:
 After each tool call in the main conversation, context-watch reads the session's usage and checks it against the marks:
 
 - **Context:** every multiple of `contextStep` (default 100k tokens).
+- **Suggested clear:** once, when the context passes `clearAt` (off by default), with "land the work in files, then clear". `/context-watch epoch` moves it for the current context alone (below).
 - **5-hour window:** 50%, 80%, 95% (`fiveHourMarks`).
 - **Weekly window:** 50%, 75%, 90% (`weeklyMarks`).
 
@@ -62,10 +63,10 @@ Notes:
 After each tool call the status line shows the same reading, with the 5-hour reset time in local time at the end:
 
 ```
-context 201k of 1000k; 5h 34%, week 41%; resets 18:00
+context 201k of 1000k, clear at 250k; 5h 34%, week 41%; resets 18:00
 ```
 
-Turn it off with `statusLine: false`.
+`clear at` shows when a suggested clear is set, with `(this context)` after it when `/context-watch epoch` set the current context's own. Turn the status line off with `statusLine: false`.
 
 ### The log
 
@@ -100,6 +101,39 @@ Both are queued when called and run when the current turn ends, once the session
 
 If the session never goes idle, each tool gives up after about 10 minutes and logs it.
 
+`resumeNote`, when set, goes into both prompts before the model's own words: something every fresh start should do first, like reading the project's notes.
+
+### The /context-watch command
+
+`/context-watch` shows the settings, the context's reading and how to change them:
+
+```
+context 120k of 1000k, clear at 250k
+  target 250k           the suggested clear, every context
+  epoch  the target's   this context's own, until the next clear or compaction
+  step   100k           a notice at every multiple
+  5h     50,80,95       5-hour usage marks (%)
+  ...
+```
+
+`/context-watch <name> <value>` changes one:
+
+| Name | Option | Example |
+| --- | --- | --- |
+| `target` | `clearAt` | `target 250k`, `target +50k`, `target off` |
+| `epoch` | none: the current context's suggested clear | `epoch 400k`, `epoch +50k`, `epoch off`, `epoch reset` |
+| `step` | `contextStep` | `step 50k` |
+| `5h`, `week` | `fiveHourMarks`, `weeklyMarks` | `week 60,80,95`, `5h none` |
+| `limitweek`, `limit5h` | none: a usage limit, until its window resets | `limitweek 44%`, `limitweek +14%`, `limit5h off` |
+| `resume` | `resumeNote` | `resume "Read NOTES.md first."`, `resume none` |
+| `status`, `log` | `statusLine`, `log` | `status off` |
+| `logcap`, `turns`, `data` | `logMaxBytes`, `keepTurns`, `dataDir` | `turns 5` |
+
+- Every name but `epoch` writes its `/config` row (`pluginConfigs` in `~/.claude/settings.json`), which reloads the mod. While a compaction or clear is on its way it refuses, as the reload would drop it.
+- `epoch` is held for the session and lasts until the next clear or compaction; then the next context starts on `target` again. `epoch reset` goes back to `target` right away.
+- `limitweek` and `limit5h` cap a usage meter: when a reading reaches the limit, the model is told to land what is in flight, and when that turn ends the conversation clears and the fresh one starts with word of it (or the model's own brief, if it called `clear_and_restart`). A context that starts past the limit is told once and not cleared again. The limits live in the mod's store, so every session on the machine keeps them, each until its meter's window resets. `+14%` counts from the meter's reading now.
+- The model is told of each change. The command runs at once, even while a turn is in flight.
+
 ### Keeping the last answer across a clear
 
 A `/clear` normally wipes the answer you were in the middle of reading. context-watch keeps the words of each turn in a small file per project (`context-watch-said-<project path>.md` in the data folder, the last `keepTurns` turns, newest first).
@@ -113,13 +147,14 @@ Set `keepTurns: 0` to turn this off.
 
 | Event | What it does |
 | --- | --- |
-| `session.start` | Registers the two tools. |
+| `session.start` | Registers the two tools and `/context-watch`. |
 | `tool.call` (every call) | Reads usage, updates the status line, checks the marks, adds the notice, logs. |
 | `tool.call` (its own two tools) | Checks the input and queues the compaction or clear. |
 | `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later. |
 | `prompt.submit` | Notes that you typed something, so a compaction doesn't send a second resume prompt. |
-| `session.compact` | Logs the tokens before and after; resets the context marks. |
-| `command.run` (`/clear`) | Holds the last turn's words for the clear's row. |
+| `session.compact` | Logs the tokens before and after; resets the context marks and the context's own suggested clear. |
+| `command.run` (`/clear`) | Holds the last turn's words for the clear's row; resets the context marks and the context's own suggested clear. |
+| `command.run` (`/context-watch`) | Shows the settings, or changes one. |
 | `ui.render` (`CommandOutput`) | Draws those words under `/clear`. |
 
 ---
@@ -195,8 +230,8 @@ claude --plugin-dir ~/.claude/mods/context-watch
 The notices already name the tools. A line in your `CLAUDE.md` makes the habit explicit, for example:
 
 ```markdown
-When context-watch says the context passed 200k, finish the current step, land it
-in files (commit, update the notes), then call clear_and_restart with a brief:
+When context-watch says the context passed the suggested clear, finish the current
+step, land it in files (commit, update the notes), then call clear_and_restart with a brief:
 what to read first, what is in flight, what to do next.
 ```
 
@@ -209,8 +244,10 @@ Every option is optional. The defaults are what the mod has always done.
 | Option | Type | Default | What it does |
 | --- | --- | --- | --- |
 | `contextStep` | number | `100000` | A notice each time the context passes a multiple of this many tokens. |
+| `clearAt` | number | `0` | The suggested clear: a notice when the context passes this many tokens. `0`: none. |
 | `fiveHourMarks` | string | `"50,80,95"` | Percentages of the 5-hour usage window that raise a notice. Empty: none. |
 | `weeklyMarks` | string | `"50,75,90"` | Percentages of the weekly usage window that raise a notice. Empty: none. |
+| `resumeNote` | string | `""` | Put into every prompt that resumes after the mod's compaction or clear, before the model's own words. |
 | `statusLine` | boolean | `true` | Show the reading in the status line after each tool call. |
 | `dataDir` | string | `"~/.claude"` | Where the log and the per-project turn files go. Use an absolute path or one starting with `~`; a relative path would land in each project. Created if missing. |
 | `log` | boolean | `true` | Write `context-watch.log` in the data folder. |
@@ -219,6 +256,7 @@ Every option is optional. The defaults are what the mod has always done.
 
 How to set them:
 
+- **`/context-watch <name> <value>`** in a session (above).
 - **`/config`** in a session. Each option is a row; a change reloads the mod.
 - **`claude plugin configure context-watch`** shows the options and which are set.
 - **By hand**, in `~/.claude/settings.json`, under `pluginConfigs`. For Option B or C the key is the plugin's name:
@@ -227,7 +265,7 @@ How to set them:
   {
     "pluginConfigs": {
       "context-watch": {
-        "options": { "contextStep": 150000, "weeklyMarks": "60,80,95", "keepTurns": 5 }
+        "options": { "contextStep": 150000, "clearAt": 250000, "weeklyMarks": "60,80,95", "keepTurns": 5 }
       }
     }
   }

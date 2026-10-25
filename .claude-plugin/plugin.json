@@ -1,7 +1,7 @@
 {
   "name": "context-watch",
-  "version": "0.3.0",
-  "description": "Tells the model its context size and plan usage at each 100k and usage mark, logs it, and lets it compact or clear itself and carry on",
+  "version": "0.4.0",
+  "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, and lets it compact or clear itself and carry on; /context-watch shows and changes the settings",
   "author": {
     "name": "spychiatrist",
     "url": "https://github.com/spychiatrist"
@@ -15,6 +15,12 @@
       "title": "Context step (tokens)",
       "description": "A notice each time the context passes a multiple of this many tokens.",
       "default": 100000
+    },
+    "clearAt": {
+      "type": "number",
+      "title": "Suggested clear (tokens)",
+      "description": "A notice when the context passes this many tokens: land the work in files, then clear. 0 turns it off. /context-watch epoch sets one for the current context only.",
+      "default": 0
     },
     "fiveHourMarks": {
       "type": "string",
@@ -57,6 +63,12 @@
       "title": "Turns kept per project",
       "description": "How many of the last turns' words are kept per project, to show again after a /clear. 0 turns this off.",
       "default": 10
+    },
+    "resumeNote": {
+      "type": "string",
+      "title": "Resume note",
+      "description": "Text put into every prompt that resumes the work after the mod's compaction or clear, before the model's own brief: say, what to read first in every project. Empty: none.",
+      "default": ""
     }
   }
 }

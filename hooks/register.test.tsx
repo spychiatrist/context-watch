@@ -202,3 +202,184 @@ test(
     expect(Object.keys(writes).some(p => p.startsWith('/home/u'))).toBe(false)
   },
 )
+
+// The suggested clear and /context-watch: a context gauge the test sets, a session, a clear,
+// and the /config rows the command writes through.
+function gauge(on: On, sets: [string, unknown][] = []) {
+  const g: { tokens: number; percent?: number } = { tokens: 0 }
+  mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
+  on('session.usage', async () => {
+    const week = g.percent === undefined ? [] : [{ kind: 'seven_day', percentUsed: g.percent, resetsAt: '2099-01-02T12:00:00Z' }]
+    return { value: { context: { tokens: g.tokens, window: 1_000_000 }, rateLimits: week } } as never
+  })
+  on('session.id', async () => ({ value: 's-1' }))
+  on('session.cwd', async () => ({ value: '/home/u/src/p' }))
+  on('fs.read', async () => ({ value: '' }))
+  on('fs.write', async () => ({ value: undefined }))
+  on('tool.call', async () => ({ result: 'ok' }) as never)
+  on('config.set', async (_, e) => (sets.push([e.key, e.value]), { value: e.value }) as never)
+  on('command.run', { command: 'clear' }, async () => ({ text: '' }))
+  on('ui.status', async () => ({ value: undefined }) as never)
+  return g
+}
+
+async function at($: Engine, g: { tokens: number }, tokens: number) {
+  g.tokens = tokens
+  const ran = (await $.tool.call({ tool: 'Bash', command: 'ls' } as never)) as { context?: readonly string[] }
+  return ran.context?.join(' ') ?? ''
+}
+
+const cw = async ($: Engine, args: string) =>
+  (await $.command.run({ command: 'context-watch', args, origin: { kind: 'composer' } } as never)) as { text?: string; context?: string[] }
+
+test('the suggested clear raises its notice once, on the way past it', { options: { clearAt: 250_000 } }, async ($, on) => {
+  const g = gauge(on)
+  await at($, g, 240_000) // the first reading is taken silently
+  const past = await at($, g, 260_000)
+  expect(past).toContain('context passed 250k, the suggested clear: land the work in files, then clear')
+  expect(past).toContain('clear at 250k')
+  expect(await at($, g, 270_000)).toBe('')
+})
+
+test('no suggested clear by default', async ($, on) => {
+  const g = gauge(on)
+  await at($, g, 240_000)
+  expect(await at($, g, 260_000)).toBe('')
+})
+
+test('/context-watch epoch moves the suggested clear for this context alone', { options: { clearAt: 250_000 } }, async ($, on) => {
+  const sets: [string, unknown][] = []
+  const g = gauge(on, sets)
+  await at($, g, 240_000)
+  const set = await cw($, 'epoch 300k')
+  expect(set.text).toContain("This context's suggested clear: 300k")
+  expect(set.context?.join(' ')).toContain('clear at 300k (this context)')
+  expect(await at($, g, 260_000)).toBe('')
+  expect(await at($, g, 310_000)).toContain('context passed 300k, the suggested clear for this context')
+  expect((await cw($, 'epoch +50k')).text).toContain('350k')
+  expect(sets).toEqual([]) // no setting changed
+
+  await $.command.run({ command: 'clear', args: '', origin: { kind: 'composer' } } as never)
+  expect((await cw($, 'epoch')).text).toContain("the target's (250k)")
+  await at($, g, 240_000)
+  expect(await at($, g, 260_000)).toContain('context passed 250k, the suggested clear:')
+})
+
+test('/context-watch epoch reset goes back to the target, and a compaction does too', { options: { clearAt: 250_000 } }, async ($, on) => {
+  gauge(on)
+  const clock = mock.clock(on)
+  let compacted = false
+  on('session.compact', async () => {
+    compacted = true
+    return { messages: [{ role: 'user', text: 'the summary', toolUses: [] }], tokensBefore: 280_000, tokensAfter: 30_000 } as never
+  })
+  on('prompt.submit', async (_, e) => ({ text: e.text }))
+  on('turn.complete', async () => ({ text: '' }))
+  await cw($, 'epoch 400k')
+  expect((await cw($, 'epoch reset')).text).toContain("the target's again: 250k")
+  await cw($, 'epoch off')
+  expect((await cw($, 'epoch')).text).toContain('epoch: off.')
+  await $.tool.call({ tool: 'mcp__context-watch__compact_and_continue', keep: 'the rules', next: 'go on' } as never)
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 100 && !compacted; i++) await tick()
+  for (let i = 0; i < 10; i++) await tick()
+  expect((await cw($, 'epoch')).text).toContain("the target's (250k)")
+})
+
+test('/context-watch target writes its /config row', { options: { clearAt: 250_000 } }, async ($, on) => {
+  const sets: [string, unknown][] = []
+  gauge(on, sets)
+  const done = await cw($, 'target 300k')
+  expect(sets).toEqual([['context-watch.clearAt', 300_000]])
+  expect(done.text).toContain('target: 250k → 300k')
+  await cw($, 'status off')
+  await cw($, 'week 60,80')
+  await cw($, 'resume "Read the notes first."')
+  expect(sets.slice(1)).toEqual([
+    ['context-watch.statusLine', false],
+    ['context-watch.weeklyMarks', '60,80'],
+    ['context-watch.resumeNote', 'Read the notes first.'],
+  ])
+})
+
+test('/context-watch refuses what it cannot take', async ($, on) => {
+  const sets: [string, unknown][] = []
+  gauge(on, sets)
+  expect((await cw($, 'target lots')).text).toContain('takes a number of tokens')
+  expect((await cw($, '5h 50,200')).text).toContain('percentages from 1 to 100')
+  expect((await cw($, 'step 0')).text).toContain('at least 1')
+  expect((await cw($, 'colour blue')).text).toContain('no setting "colour"')
+  expect(sets).toEqual([])
+})
+
+test('/context-watch shows every setting', { options: { clearAt: 250_000 } }, async ($, on) => {
+  const g = gauge(on)
+  g.tokens = 120_000
+  const text = (await cw($, '')).text ?? ''
+  expect(text).toContain('context 120k of 1000k, clear at 250k')
+  for (const name of ['target', 'epoch', 'step', '5h', 'week', 'resume', 'status', 'log', 'logcap', 'turns', 'data'])
+    expect(text).toMatch(new RegExp(`\\n  ${name} `))
+})
+
+// A change of a setting reloads the mod, which would drop a clear on its way.
+test('/context-watch changes no setting while a clear is queued', async ($, on) => {
+  const sets: [string, unknown][] = []
+  gauge(on, sets)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on' } as never)
+  expect((await cw($, 'target 300k')).text).toContain('on its way')
+  expect(sets).toEqual([])
+})
+
+test('the resume note opens the brief after a clear', { options: { resumeNote: 'Read the notes first.' } }, async ($, on) => {
+  const prompts: string[] = []
+  const clock = world(on, [], prompts, TURN)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on' } as never)
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 100 && !prompts.length; i++) await tick()
+  expect(prompts[0]).toContain('if a detail is missing). Read the notes first. carry on')
+})
+
+// A usage limit: the week meter as the test sets it, and the store the limits live in.
+function meter(on: On, sets: [string, unknown][] = []) {
+  const g = gauge(on, sets)
+  g.percent = 40
+  mock.store(on)
+  return g
+}
+
+async function call($: Engine) {
+  const ran = (await $.tool.call({ tool: 'Bash', command: 'ls' } as never)) as { context?: readonly string[] }
+  return ran.context?.join(' ') ?? ''
+}
+
+test('limitweek: reached in a turn, the conversation clears when it ends, with word of it', async ($, on) => {
+  const prompts: string[] = []
+  const clock = mock.clock(on)
+  const w = meter(on)
+  on('session.messages', async () => ({ value: TURN }) as never)
+  on('prompt.submit', async (_, e) => (prompts.push(e.text), { text: e.text }))
+  on('turn.complete', async () => ({ text: '' }))
+  const set = await cw($, 'limitweek +4%')
+  expect(set.text).toContain('limitweek: 44% to 01-02 12:00Z, the meter at 40%')
+  await call($)
+  w.percent = 44
+  expect(await call($)).toContain('week usage reached its limit, 44% (/context-watch limitweek): the conversation clears when this turn ends')
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 100 && !prompts.length; i++) await tick()
+  expect(prompts[0]).toContain('Starting fresh: the week usage limit, 44%, was reached (44%), so the conversation was cleared')
+  expect(prompts[0]).toContain('Start nothing new')
+  // The fresh context is past it from its first reading: a word, no second clear.
+  expect(await call($)).toContain('is past its limit, 44%')
+  expect(await call($)).toBe('')
+})
+
+test('limitweek off, and a limit already reached clears at the end of the turn', async ($, on) => {
+  meter(on)
+  expect((await cw($, 'limitweek 30%')).text).toContain('reached already (40%)')
+  expect((await cw($, 'limitweek off')).text).toBe('limitweek: off.')
+  expect((await cw($, 'limitweek')).text).toBe('limitweek: off; the week meter reads 40%.')
+  expect((await cw($, 'limitweek lots')).text).toContain('takes a percentage')
+})
