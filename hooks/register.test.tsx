@@ -354,10 +354,12 @@ async function call($: Engine) {
   return ran.context?.join(' ') ?? ''
 }
 
-test('limitweek: reached in a turn, the conversation clears when it ends, with word of it', async ($, on) => {
+test('limitweek: reached in a turn, the model is told to land and stop, and nothing clears', async ($, on) => {
   const prompts: string[] = []
+  const cleared: string[] = []
   const clock = mock.clock(on)
   const w = meter(on)
+  on('command.run', { command: 'clear' }, async (_, e) => (cleared.push(e.origin?.kind ?? '?'), { text: '' }))
   on('session.messages', async () => ({ value: TURN }) as never)
   on('prompt.submit', async (_, e) => (prompts.push(e.text), { text: e.text }))
   on('turn.complete', async () => ({ text: '' }))
@@ -365,21 +367,93 @@ test('limitweek: reached in a turn, the conversation clears when it ends, with w
   expect(set.text).toContain('limitweek: 44% to 01-02 12:00Z, the meter at 40%')
   await call($)
   w.percent = 44
-  expect(await call($)).toContain('week usage reached its limit, 44% (/context-watch limitweek): the conversation clears when this turn ends')
+  const word = await call($)
+  expect(word).toContain('week usage reached its limit, 44% (/context-watch limitweek): land what is in flight')
+  expect(word).toContain('start nothing new')
+  expect(word).toContain('The conversation stays as it is')
   await $.turn.complete({ reason: 'answer', answer: '' } as never)
   await clock.advance(1000)
-  for (let i = 0; i < 100 && !prompts.length; i++) await tick()
-  expect(prompts[0]).toContain('Starting fresh: the week usage limit, 44%, was reached (44%), so the conversation was cleared')
-  expect(prompts[0]).toContain('Start nothing new')
-  // The fresh context is past it from its first reading: a word, no second clear.
-  expect(await call($)).toContain('is past its limit, 44%')
-  expect(await call($)).toBe('')
+  for (let i = 0; i < 20; i++) await tick() // time for a clear, were one coming
+  expect(cleared).toEqual([])
+  expect(prompts).toEqual([])
+  expect(await call($)).toBe('') // told once a context
 })
 
-test('limitweek off, and a limit already reached clears at the end of the turn', async ($, on) => {
+test('limitweek off, and a limit already reached says so at once, with no clear', async ($, on) => {
   meter(on)
-  expect((await cw($, 'limitweek 30%')).text).toContain('reached already (40%)')
+  const set = await cw($, 'limitweek 30%')
+  expect(set.text).toContain('reached already (40%): the model is told to land what is in flight')
+  expect(set.context?.join(' ')).toContain('start nothing new')
+  expect(await call($)).toBe('') // already told, by the command
   expect((await cw($, 'limitweek off')).text).toBe('limitweek: off.')
   expect((await cw($, 'limitweek')).text).toBe('limitweek: off; the week meter reads 40%.')
   expect((await cw($, 'limitweek lots')).text).toContain('takes a percentage')
+})
+
+// The meters are the account's, but a limit is the window's: another session's work goes on.
+test("a limit holds in its own window: nothing in the store, and 0.4.0's shared one is gone", async ($, on) => {
+  gauge(on).percent = 40
+  const kept: Record<string, unknown> = { limits: { seven_day: { percent: 30 } } }
+  on('store.get', async (_, e) => ({ value: kept[e.key] }) as never)
+  on('store.set', async (_, e) => ((kept[e.key] = e.value), { value: undefined }) as never)
+  on('store.delete', async (_, e) => (delete kept[e.key], { value: undefined }) as never)
+  on('session.start', async (_, e) => e as never)
+  on('tool.register', async () => ({ value: undefined }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/home/u/src/p' } as never)
+  expect(kept).toEqual({})
+  expect(await call($)).toBe('') // the old shared limit says nothing
+  await cw($, 'limitweek 50%')
+  expect(kept).toEqual({})
+  expect((await cw($, 'limitweek')).text).toBe('limitweek: 50% to 01-02 12:00Z; the week meter reads 40%.')
+})
+
+// A clear waits for an idle session; the user's prompt in the meantime means they are
+// reading and working in this conversation, so the clear is dropped and the model told.
+test("the user's prompt drops a queued clear, and the model hears of it", async ($, on) => {
+  const cleared: string[] = []
+  const prompts: string[] = []
+  const clock = world(on, cleared, prompts, TURN)
+  on('tool.call', async () => ({ result: 'ok' }) as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on' } as never)
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await $.prompt.submit({ text: 'no, stop', origin: { kind: 'composer' }, wait: false } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 20; i++) await tick()
+  expect(cleared).toEqual([])
+  expect(prompts).toEqual(['no, stop'])
+  const ran = (await $.tool.call({ tool: 'Bash', command: 'ls' } as never)) as { context?: readonly string[] }
+  expect(ran.context?.join(' ')).toContain('The clear queued at the end of a turn was dropped: the user spoke')
+})
+
+// A turn not the user's (a background task's report, say) can run before the clear finds the
+// session idle: the answer pasted is the one on screen when the clear runs, not the one before.
+test('the answer pasted is the one on screen when the clear runs', async ($, on) => {
+  const prompts: string[] = []
+  let messages: unknown[] = TURN
+  const clock = mock.clock(on)
+  mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
+  on('session.cwd', async () => ({ value: '/home/u/src/p' }))
+  on('session.id', async () => ({ value: 's-1' }))
+  on('session.usage', async () => ({ value: { context: { tokens: 205_000, window: 1_000_000 }, rateLimits: [] } }) as never)
+  on('session.messages', async () => ({ value: messages }) as never)
+  on('fs.read', async () => ({ value: '' }))
+  on('fs.write', async () => ({ value: undefined }))
+  let tries = 0
+  on('command.run', { command: 'clear' }, async () => {
+    if (tries++ === 0) {
+      messages = [...TURN, { role: 'user', text: 'a task finished', toolUses: [] }, { role: 'assistant', text: 'The newer answer.', toolUses: [] }]
+      throw new Error('a turn is running')
+    }
+    return { text: '' }
+  })
+  on('prompt.submit', async (_, e) => (prompts.push(e.text), { text: e.text }))
+  on('turn.complete', async () => ({ text: '' }))
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on' } as never)
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 20 && tries < 1; i++) await tick()
+  await clock.advance(5000)
+  for (let i = 0; i < 100 && !prompts.length; i++) await tick()
+  expect(prompts[0]?.endsWith('\n\nThe newer answer.')).toBe(true)
 })

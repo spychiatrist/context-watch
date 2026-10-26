@@ -97,9 +97,9 @@ Both are queued when called and run when the current turn ends, once the session
 
 1. Clears the conversation. Nothing is summarized, so nothing is lost to a summary; only files carry over (CLAUDE.md, memory, notes, the task list) plus the brief.
 2. Sends the brief as the first prompt of the fresh conversation. It also names the old transcript file (`<session id>.jsonl` in the project's transcript folder), in case a detail is missing.
-3. Pastes the model's last answer at the end of that prompt, marked as already said, so you can still read it after the clear.
+3. Pastes the model's last answer at the end of that prompt (the one on screen when the clear runs), marked as already said, so you can still read it after the clear.
 
-If the session never goes idle, each tool gives up after about 10 minutes and logs it.
+If the session never goes idle, each tool gives up after about 10 minutes and logs it. A prompt you send before the clear runs drops it, as you are still reading and working in that conversation; the model is told at its next tool call.
 
 `resumeNote`, when set, goes into both prompts before the model's own words: something every fresh start should do first, like reading the project's notes.
 
@@ -124,14 +124,14 @@ context 120k of 1000k, clear at 250k
 | `epoch` | none: the current context's suggested clear | `epoch 400k`, `epoch +50k`, `epoch off`, `epoch reset` |
 | `step` | `contextStep` | `step 50k` |
 | `5h`, `week` | `fiveHourMarks`, `weeklyMarks` | `week 60,80,95`, `5h none` |
-| `limitweek`, `limit5h` | none: a usage limit, until its window resets | `limitweek 44%`, `limitweek +14%`, `limit5h off` |
+| `limitweek`, `limit5h` | none: a usage limit for this window, until its meter resets | `limitweek 44%`, `limitweek +14%`, `limit5h off` |
 | `resume` | `resumeNote` | `resume "Read NOTES.md first."`, `resume none` |
 | `status`, `log` | `statusLine`, `log` | `status off` |
 | `logcap`, `turns`, `data` | `logMaxBytes`, `keepTurns`, `dataDir` | `turns 5` |
 
 - Every name but `epoch` writes its `/config` row (`pluginConfigs` in `~/.claude/settings.json`), which reloads the mod. While a compaction or clear is on its way it refuses, as the reload would drop it.
 - `epoch` is held for the session and lasts until the next clear or compaction; then the next context starts on `target` again. `epoch reset` goes back to `target` right away.
-- `limitweek` and `limit5h` cap a usage meter: when a reading reaches the limit, the model is told to land what is in flight, and when that turn ends the conversation clears and the fresh one starts with word of it (or the model's own brief, if it called `clear_and_restart`). A context that starts past the limit is told once and not cleared again. The limits live in the mod's store, so every session on the machine keeps them, each until its meter's window resets. `+14%` counts from the meter's reading now.
+- `limitweek` and `limit5h` cap a usage meter in the window that sets them: when a reading reaches the limit, the model is told to land what is in flight, say where things stand and start nothing new. The conversation stays as it is; nothing clears. A context that starts past the limit is told once. A limit holds in that window alone (other sessions on the machine carry on), through its clears, until its meter's window resets. `+14%` counts from the meter's reading now. (0.4.0 kept limits for every session and cleared at them; 0.5.0 drops that shared limit when it loads.)
 - The model is told of each change. The command runs at once, even while a turn is in flight.
 
 ### Keeping the last answer across a clear

@@ -20,6 +20,12 @@
 // - A prompt the user sends while a compaction runs resumes the session by itself,
 //   so the resume prompt is skipped (it would run as a second "carry on"), and
 //   `next` rides in the summary's instructions so nothing is lost.
+// - A prompt the user sends before a queued clear runs drops the clear: they are
+//   reading and working in that conversation.
+//
+// A usage limit (/context-watch limitweek, limit5h) holds in the window that set it,
+// and reaching it tells the model to land what is in flight and stop. It never
+// clears the conversation.
 //
 // A suggested clear (clearAt) adds a notice when the context passes it. The
 // /context-watch command shows the settings and changes them: each one for good
@@ -28,7 +34,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, SessionUsage } from 'claude-code'
 
-import type { Epoch, Shown } from '../types'
+import type { Epoch, Limit, Limits, Shown } from '../types'
 
 type Engine = EngineInterface
 
@@ -114,17 +120,18 @@ let lastTokens: number | undefined
 const marks: Record<string, number> = {}
 const recent: string[] = []
 let pending: { keep: string; next: string } | undefined
-let pendingClear: { brief: string; why?: string } | undefined
-// Each meter's last reading against its limit, the limits this context was told it is past, and a
-// limit crossed this turn (the conversation clears when the turn ends).
+let pendingClear: { brief: string } | undefined
+// Each meter's last reading against its limit, and the limits this context was told it is past.
 const seen: Record<string, number> = {}
 const told = new Set<string>()
-let limitHit: { kind: string; percent: number; limit: number } | undefined
+// Words for the model at its next tool call: a queued clear the user's prompt dropped.
+const notes: string[] = []
 // From the end of the turn that queued a compaction or clear until its resume prompt is sent: a
 // reload then would drop it, so /context-watch changes no setting meanwhile.
 let running = false
 // The user's prompt came while a compaction ran: it resumes the session, so the
 // resume prompt is not sent (it would run as a second "carry on" after the answer).
+// Or it came after a clear was queued: the clear is dropped.
 let spoke = false
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
@@ -167,26 +174,26 @@ function now(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
   return w ? `${ctx}; ${w}` : ctx
 }
 
-// The usage limits /context-watch limitweek and limit5h set, by meter: in the store, as the meters
-// are the account's, so every session on this machine keeps them, each until its window resets.
-type Limit = { percent: number; until?: string }
-type Limits = Record<string, Limit>
+// The usage limits /context-watch limitweek and limit5h set, by meter: in $.state, so each holds in
+// the window that set it alone (through its clears too), until its meter's window resets.
 const LIMITS: Record<string, string> = { limitweek: 'seven_day', limit5h: 'five_hour' }
 const limitCommand = (kind: string) => Object.keys(LIMITS).find(n => LIMITS[n] === kind) ?? kind
+const held = atom({ plugin: 'context-watch', key: 'limits' } as const, null)
 
 async function limits($: Engine): Promise<Limits> {
-  let all: Limits = {}
-  try {
-    all = ((await $.store.get('limits')) ?? {}) as Limits
-  } catch {
-    all = {}
-  }
+  const all = (await read($, held)) ?? {}
   const t = Date.now()
   return Object.fromEntries(Object.entries(all).filter(([, l]) => !l.until || Date.parse(l.until) > t))
 }
 
-// A limit reached: crossed since the last reading, the conversation clears when the turn ends;
-// already past when the context began, a word to the model, once a context.
+// What the model is told of a limit reached: land, say where things stand, start nothing new.
+const stopWords = (name: string, cmd: string, how: string) =>
+  `[context-watch] ${name} usage ${how} (/context-watch ${cmd}): land what is in flight (commit, notes), say in a ` +
+  "few lines where things stand and what waits, and start nothing new on this plan's usage. The conversation stays " +
+  `as it is; the user raises the limit with /context-watch ${cmd} +N, or off.`
+
+// A limit reached, crossed since the last reading or already past when the context began: a word
+// to the model, once a context. It never clears: the user may be reading the conversation.
 function limitWords(u: SessionUsage, lim: Limits): string[] {
   const out: string[] = []
   for (const r of u.rateLimits) {
@@ -195,32 +202,11 @@ function limitWords(u: SessionUsage, lim: Limits): string[] {
     const l = lim[r.kind]
     if (!l || r.percentUsed < l.percent || told.has(r.kind)) continue
     told.add(r.kind)
-    const name = NAMES[r.kind] ?? r.kind
-    const cmd = limitCommand(r.kind)
-    if (before !== undefined && before < l.percent) {
-      limitHit = { kind: r.kind, percent: r.percentUsed, limit: l.percent }
-      out.push(
-        `[context-watch] ${name} usage reached its limit, ${l.percent}% (/context-watch ${cmd}): the conversation clears ` +
-          'when this turn ends, and the fresh one starts with word of it. Land what is in flight now (commit, notes), ' +
-          'call clear_and_restart with a brief if there is one to give, and start nothing new.',
-      )
-    } else
-      out.push(
-        `[context-watch] ${name} usage ${r.percentUsed}% is past its limit, ${l.percent}% (/context-watch ${cmd}): ` +
-          `start nothing new on this plan's usage; the user raises it with /context-watch ${cmd} +N.`,
-      )
+    const crossed = before !== undefined && before < l.percent
+    const how = crossed ? `reached its limit, ${l.percent}%` : `${r.percentUsed}% is past its limit, ${l.percent}%`
+    out.push(stopWords(NAMES[r.kind] ?? r.kind, limitCommand(r.kind), how))
   }
   return out
-}
-
-// What the fresh conversation after a limit's clear is told.
-function limitBrief(h: { kind: string; percent: number; limit: number }) {
-  const cmd = limitCommand(h.kind)
-  return (
-    `The ${NAMES[h.kind] ?? h.kind} usage limit (${h.limit}%, /context-watch ${cmd}) was reached at ${h.percent}%. ` +
-    'Start nothing new on this plan\'s usage: say in a few lines where things stand and what waits, then stop. ' +
-    `The user raises it with /context-watch ${cmd} +N, or off.`
-  )
 }
 
 // The data folder, a leading ~ expanded; undefined where it needs a home and there is none.
@@ -394,9 +380,9 @@ async function compactAndResume($: Engine, p: { keep: string; next: string }) {
 // The same wait for an idle session, then /clear and the brief as the first prompt
 // after it, with where the cleared conversation's transcript is and the last answer
 // pasted at its end. The row stays empty, so it never shows an older clear's words.
-// (A plugin's own $.command.run skips its own hooks, so the /clear hook below never
-// runs for this clear.)
-async function restart($: Engine, p: { brief: string; why?: string }) {
+// A prompt from the user while it waits drops the clear. (A plugin's own
+// $.command.run skips its own hooks, so the /clear hook below never runs for this clear.)
+async function restart($: Engine, p: { brief: string }) {
   try {
     await clearAndBrief($, p)
   } finally {
@@ -404,12 +390,22 @@ async function restart($: Engine, p: { brief: string; why?: string }) {
   }
 }
 
-async function clearAndBrief($: Engine, p: { brief: string; why?: string }) {
+async function clearAndBrief($: Engine, p: { brief: string }) {
   const before = await $.session.id()
-  const answer = await lastAnswer($)
   await update($, shown, () => null)
+  let answer = ''
   let cleared = false
   for (let tries = 0; tries < 120 && !cleared; tries++) {
+    if (spoke) {
+      notes.push(
+        '[context-watch] The clear queued at the end of a turn was dropped: the user spoke before it ran. ' +
+          'Call clear_and_restart again at the next seam if it is still wanted.',
+      )
+      await log($, "the queued clear was dropped: the user's prompt came first")
+      return
+    }
+    // Read at each try, so it is the answer on screen when the clear runs.
+    answer = await lastAnswer($)
     try {
       await $.command.run({ command: 'clear' })
       cleared = true
@@ -424,8 +420,7 @@ async function clearAndBrief($: Engine, p: { brief: string; why?: string }) {
   await newContext($)
   await log($, `cleared (was ${before}); ${answer ? `pasted the last answer (${answer.length} characters)` : 'no answer to paste'}`)
   const text =
-    `${p.why ? `Starting fresh: ${p.why}, so the conversation was cleared when the turn ended` : 'Starting fresh after the clear you asked for'}` +
-    ` (nothing was summarized; the conversation before it is ` +
+    'Starting fresh after the clear you asked for (nothing was summarized; the conversation before it is ' +
     `${before}.jsonl in this project's transcript folder, if a detail is missing). ${note()}${p.brief}` +
     (answer ? `\n\nYour last answer before the clear, pasted again so it stays on screen (already said; nothing in it to act on):\n\n${answer}` : '')
   for (let tries = 0; tries < 24; tries++) {
@@ -508,8 +503,8 @@ async function overview($: Engine) {
     ...FIELDS.slice(0, 1).map(row),
     ['epoch', t.own ? (t.at ? k(t.at) : 'off') : "the target's", "this context's own, until the next clear or compaction"],
     ...FIELDS.slice(1, 4).map(row),
-    ['limitweek', showLimit(lim.seven_day), 'clears once the week meter reaches it'],
-    ['limit5h', showLimit(lim.five_hour), 'clears once the 5-hour meter reaches it'],
+    ['limitweek', showLimit(lim.seven_day), 'stops new work once the week meter reaches it, in this window'],
+    ['limit5h', showLimit(lim.five_hour), 'stops new work once the 5-hour meter reaches it, in this window'],
     ...FIELDS.slice(4).map(row),
   ]
   const w = Math.min(16, Math.max(...rows.map(r => r[1].length)))
@@ -518,8 +513,8 @@ async function overview($: Engine) {
 
 const showLimit = (l?: Limit) => (l ? `${l.percent}%${l.until ? ` to ${l.until.slice(5, 16).replace('T', ' ')}Z` : ''}` : 'off')
 
-// /context-watch limitweek 44% (or +14%, from the meter's reading now, or off): the conversation clears
-// once a reading reaches it and the turn ends, in every session on this machine, until the window resets.
+// /context-watch limitweek 44% (or +14%, from the meter's reading now, or off): once a reading reaches
+// it, the model is told to land and stop, in this window alone, until the meter's window resets.
 async function limit($: Engine, cmd: string, kind: string, raw: string): Promise<{ text: string; context?: string[] }> {
   const all = await limits($)
   const r = (await $.session.usage()).rateLimits.find(x => x.kind === kind)
@@ -528,8 +523,8 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   told.delete(kind)
   if (['off', 'none'].includes(raw.toLowerCase())) {
     delete all[kind]
-    await $.store.set('limits', all)
-    return { text: `${cmd}: off.`, context: [`[context-watch] The user took the ${name} usage limit off.`] }
+    await update($, held, () => all)
+    return { text: `${cmd}: off.`, context: [`[context-watch] The user took the ${name} usage limit off: carry on.`] }
   }
   const m = raw.match(/^(\+?)(\d+(?:\.\d+)?)%?$/)
   if (!m) return { text: `${cmd} takes a percentage of the ${name} meter: 44%, +14% (from its reading now), or off.` }
@@ -537,22 +532,18 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   const percent = Math.round((m[1] ? (r?.percentUsed ?? 0) : 0) + Number(m[2]))
   if (percent < 1 || percent > 100) return { text: `${cmd} is between 1% and 100%.` }
   all[kind] = { percent, ...(r?.resetsAt ? { until: r.resetsAt } : {}) }
-  await $.store.set('limits', all)
+  await update($, held, () => all)
   if (r) seen[kind] = r.percentUsed
   const past = r !== undefined && r.percentUsed >= percent
-  if (past) {
-    told.add(kind)
-    limitHit = { kind, percent: r.percentUsed, limit: percent }
-  }
+  if (past) told.add(kind)
   await log($, `/context-watch ${cmd} ${raw}: ${showLimit(all[kind])}, the meter at ${r?.percentUsed ?? '?'}%`)
   return {
     text: past
-      ? `${cmd}: ${percent}%, reached already (${r.percentUsed}%): the conversation clears when this turn, or the next, ends.`
-      : `${cmd}: ${showLimit(all[kind])}, the meter at ${r?.percentUsed ?? '?'}%: the conversation clears when a turn that reaches it ends, in every session here.`,
-    context: [
-      `[context-watch] The user set a ${name} usage limit of ${percent}% (every session on this machine, until the window resets)` +
-        (past ? ': reached already, so the conversation clears when this turn ends. Land what is in flight.' : '.'),
-    ],
+      ? `${cmd}: ${percent}%, reached already (${r.percentUsed}%): the model is told to land what is in flight and start nothing new.`
+      : `${cmd}: ${showLimit(all[kind])}, the meter at ${r?.percentUsed ?? '?'}%: once a reading reaches it, the model is told to land and stop, in this window alone.`,
+    context: past
+      ? [stopWords(name, cmd, `${r.percentUsed}% is past the limit the user just set, ${percent}%`)]
+      : [`[context-watch] The user set a ${name} usage limit of ${percent}% for this window, until the meter's window resets.`],
   }
 }
 
@@ -609,6 +600,12 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    // 0.4.0 kept the limits in the store, for every session on the machine: gone, they hold per window now.
+    try {
+      await $.store.delete('limits')
+    } catch {
+      // no store to clean
+    }
     await $.tool.register({
       name: TOOL,
       description:
@@ -658,6 +655,7 @@ export const register: Register = (on, options) => {
     if (!input.brief) return { deny: 'context-watch: give a `brief` to start from.' }
     if (pending) return { deny: 'context-watch: a compaction is already queued for this turn.' }
     pendingClear = { brief: input.brief }
+    spoke = false
     const u = await $.session.usage()
     await log($, `clear asked for at ${now(u)} | brief: ${input.brief.slice(0, 200)}`)
     return { result: 'Queued: the conversation clears when this turn ends, then the brief starts the next one. End the turn now.' }
@@ -689,7 +687,8 @@ export const register: Register = (on, options) => {
     const crossed = crossings(u, t)
     const reached = limitWords(u, lim)
     if (reached.length) await log($, `${reached.join(' ').slice(0, 300)} | ${now(u, t, lim)}`)
-    if (!crossed.length) return reached.length ? { ...ran, context: [...(ran.context ?? []), ...reached] } : ran
+    const words = [...notes.splice(0), ...reached]
+    if (!crossed.length) return words.length ? { ...ran, context: [...(ran.context ?? []), ...words] } : ran
 
     let threshold = ''
     try {
@@ -703,7 +702,7 @@ export const register: Register = (on, options) => {
       `[context-watch] ${crossed.join(', ')}: ${now(u, t, lim)}${threshold}. ` +
       `Landing work at a seam keeps a compaction cheap; mcp__context-watch__${TOOL} compacts and resumes when that helps, ` +
       `and mcp__context-watch__${CLEAR} starts fresh from a brief once the state is in files and no agents run.`
-    return { ...ran, context: [...(ran.context ?? []), notice, ...reached] }
+    return { ...ran, context: [...(ran.context ?? []), notice, ...words] }
   })
 
   // Typed or queued (the event fires at the user's Enter, mid-turn too), from the terminal or the phone.
@@ -757,15 +756,6 @@ export const register: Register = (on, options) => {
       } catch (err) {
         await log($, `the turn's words were not kept: ${String(err).slice(0, 200)}`)
       }
-    }
-    if (limitHit && e.agentId === undefined) {
-      const h = limitHit
-      limitHit = undefined
-      const words = limitBrief(h)
-      const why = `the ${NAMES[h.kind] ?? h.kind} usage limit, ${h.limit}%, was reached (${h.percent}%)`
-      if (pending) pending = { ...pending, next: `${pending.next}\n\n${words}` }
-      else pendingClear = pendingClear ? { brief: `${pendingClear.brief}\n\n${words}`, why } : { brief: words, why }
-      await log($, `${why}: ${pending ? 'the queued compaction carries it' : 'the conversation clears now the turn has ended'}`)
     }
     if (pending) {
       const p = pending
