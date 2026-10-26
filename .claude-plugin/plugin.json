@@ -1,6 +1,6 @@
 {
   "name": "context-watch",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, and lets it compact or clear itself and carry on; /context-watch shows and changes the settings",
   "author": {
     "name": "spychiatrist",

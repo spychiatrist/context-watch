@@ -147,6 +147,44 @@ test('compact_and_continue sends no resume prompt when the user speaks during th
   expect(sent).toEqual(['why compact?'])
 })
 
+// T182: an agent's report woke the session after a compaction, and the resume prompt queued
+// behind its turn as a second "carry on". Any prompt but the mod's own resumes the session.
+for (const origin of [{ kind: 'peer-send-message' }, { kind: 'task-notification' }, { kind: 'plugin', name: 'talkback' }]) {
+  test(`compact_and_continue sends no resume prompt when a ${origin.kind} prompt comes during the compaction`, async ($, on) => {
+    const sent: string[] = []
+    const clock = world(on, [], sent, TURN)
+    let compacted = false
+    on('session.compact', async () => {
+      await $.prompt.submit({ text: 'an agent finished', origin, wait: false } as never)
+      compacted = true
+      return { messages: [{ role: 'user', text: 'the summary', toolUses: [] }], tokensBefore: 214_000, tokensAfter: 30_000 } as never
+    })
+    await $.tool.call({ tool: 'mcp__context-watch__compact_and_continue', keep: 'the rules', next: 'step two next' } as never)
+    await $.turn.complete({ reason: 'answer', answer: '' } as never)
+    await clock.advance(1000)
+    for (let i = 0; i < 100 && !compacted; i++) await tick()
+    for (let i = 0; i < 20; i++) await tick() // time for a resume prompt, were one coming
+
+    expect(sent).toEqual(['an agent finished'])
+  })
+}
+
+// A notice while a clear waits is not the user: the clear still runs, and its brief follows.
+test("a task's notice does not drop a queued clear; the user's prompt does", async ($, on) => {
+  const cleared: string[] = []
+  const prompts: string[] = []
+  const clock = world(on, cleared, prompts, TURN)
+  on('tool.call', async () => ({ result: 'ok' }) as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on' } as never)
+  await $.turn.complete({ reason: 'answer', answer: '' } as never)
+  await $.prompt.submit({ text: 'a task finished', origin: { kind: 'task-notification' }, wait: false } as never)
+  await clock.advance(1000)
+  for (let i = 0; i < 100 && prompts.length < 2; i++) await tick()
+  expect(cleared.length).toBe(1)
+  expect(prompts[0]).toBe('a task finished')
+  expect(prompts[1]?.startsWith('Starting fresh after the clear you asked for')).toBe(true)
+})
+
 test('compact_and_continue resumes with next when nobody spoke', async ($, on) => {
   const sent: string[] = []
   const clock = world(on, [], sent, TURN)

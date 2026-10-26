@@ -91,7 +91,7 @@ Both are queued when called and run when the current turn ends, once the session
 
 1. Compacts the conversation, telling the summarizer what must survive (`keep`).
 2. Sends `next` as the prompt that resumes the work.
-3. If you type a prompt while the compaction runs, yours resumes the session instead and no second "carry on" is sent. `next` is in the summary's instructions too, so it isn't lost.
+3. If a prompt comes while the compaction runs (yours, a background task's report, another session's message), it resumes the session instead and no second "carry on" is sent. `next` is in the summary's instructions too, so it isn't lost.
 
 **clear_and_restart** (`brief`)
 
@@ -151,7 +151,7 @@ Set `keepTurns: 0` to turn this off.
 | `tool.call` (every call) | Reads usage, updates the status line, checks the marks, adds the notice, logs. |
 | `tool.call` (its own two tools) | Checks the input and queues the compaction or clear. |
 | `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later. |
-| `prompt.submit` | Notes that you typed something, so a compaction doesn't send a second resume prompt. |
+| `prompt.submit` | Notes that a prompt came, so a compaction doesn't send a second resume prompt; one you typed also drops a queued clear. |
 | `session.compact` | Logs the tokens before and after; resets the context marks and the context's own suggested clear. |
 | `command.run` (`/clear`) | Holds the last turn's words for the clear's row; resets the context marks and the context's own suggested clear. |
 | `command.run` (`/context-watch`) | Shows the settings, or changes one. |

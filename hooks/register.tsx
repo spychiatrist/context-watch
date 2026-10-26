@@ -17,9 +17,10 @@
 // - After clear_and_restart, the last answer is pasted at the end of the brief
 //   prompt instead: a row drawn by the clear scrolls away before it can be read.
 //   That clear draws no row, so it never shows an older clear's words.
-// - A prompt the user sends while a compaction runs resumes the session by itself,
-//   so the resume prompt is skipped (it would run as a second "carry on"), and
-//   `next` rides in the summary's instructions so nothing is lost.
+// - A prompt that comes while a compaction runs (the user's, a background task's
+//   report, another session's message) resumes the session by itself, so the
+//   resume prompt is skipped (it would run as a second "carry on"), and `next`
+//   rides in the summary's instructions so nothing is lost.
 // - A prompt the user sends before a queued clear runs drops the clear: they are
 //   reading and working in that conversation.
 //
@@ -129,9 +130,12 @@ const notes: string[] = []
 // From the end of the turn that queued a compaction or clear until its resume prompt is sent: a
 // reload then would drop it, so /context-watch changes no setting meanwhile.
 let running = false
-// The user's prompt came while a compaction ran: it resumes the session, so the
-// resume prompt is not sent (it would run as a second "carry on" after the answer).
-// Or it came after a clear was queued: the clear is dropped.
+// A prompt came while a compaction ran, from where (the user, a task's notice, a peer): its
+// turn resumes the session, so the resume prompt is not sent (it would run as a second
+// "carry on" after that turn). The mod's own prompts never reach its own hook.
+let resumedBy: string | undefined
+// The user's own prompt came after a clear was queued: they are reading and working in
+// this conversation, so the clear is dropped. A notice or a peer's message is not them.
 let spoke = false
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
@@ -355,8 +359,8 @@ async function compactAndResume($: Engine, p: { keep: string; next: string }) {
   // compact() rejects while a turn runs: wait for the session to settle.
   for (let tries = 0; tries < 120; tries++) {
     try {
-      spoke = false
-      // `next` in the summary too, for when the user's prompt resumes it instead of ours.
+      resumedBy = undefined
+      // `next` in the summary too, for when another prompt resumes it instead of ours.
       const done = await $.session.compact({ instructions: `${p.keep}\n\nNext, once it resumes: ${p.next}` })
       if ('skip' in done && done.skip !== undefined) {
         await log($, `compaction skipped by a hook: ${done.skip}`)
@@ -364,8 +368,9 @@ async function compactAndResume($: Engine, p: { keep: string; next: string }) {
       }
       // A plugin's own $.session.compact skips its own hooks, the session.compact one below too.
       await newContext($)
-      if (spoke) {
-        await log($, "compacted; the user's prompt came during it and resumes the session, so no resume prompt")
+      // Checked last, just before the submit: nothing may come between.
+      if (resumedBy) {
+        await log($, `compacted; a prompt (${resumedBy}) came during it and resumes the session, so no resume prompt`)
         return
       }
       await $.prompt.submit({ text: `Resuming after the compaction you asked for. ${note()}${p.next}` })
@@ -705,8 +710,10 @@ export const register: Register = (on, options) => {
     return { ...ran, context: [...(ran.context ?? []), notice, ...words] }
   })
 
-  // Typed or queued (the event fires at the user's Enter, mid-turn too), from the terminal or the phone.
+  // Any prompt but the mod's own: typed or queued (the event fires at the user's Enter, mid-turn
+  // too), from the terminal or the phone, or a notice, a peer's message, another mod's.
   on('prompt.submit', async ($, e, next) => {
+    resumedBy = e.origin.kind
     if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') spoke = true
     return next(e)
   })
