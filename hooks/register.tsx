@@ -28,20 +28,31 @@
 // and reaching it tells the model to land what is in flight and stop. It never
 // clears the conversation.
 //
+// A night (/context-watch night 96% until 09:30, or the night tool the model calls when
+// the user names a cap) runs the session on to a line on the week meter: a turn of the
+// main loop that ends under it is resumed by a carry-on prompt two minutes on, or at the
+// 5-hour window's reset when that is spent. The user's prompt ends it, as do its line, its
+// stop time and the week's reset. A turn that ends waiting on the user ("Needs you:") or
+// finding nothing ready pauses it until the next prompt; so does a resumed turn that makes
+// no tool call, and the eighth resume in an hour.
+//
 // A suggested clear (clearAt) adds a notice when the context passes it. The
 // /context-watch command shows the settings and changes them: each one for good
 // (the rows /config shows), or the suggested clear for the current context alone,
 // until the next clear or compaction.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, SessionUsage } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
-import type { Epoch, Limit, Limits, Shown } from '../types'
+import type { Epoch, Limit, Limits, Night, Shown } from '../types'
 
 type Engine = EngineInterface
 
 const NAMES: Record<string, string> = { five_hour: '5h', seven_day: 'week' }
 const TOOL = 'compact_and_continue'
 const CLEAR = 'clear_and_restart'
+const NIGHT = 'night'
+// The mod's own tools: no tool call of the work, so neither counted nor noticed.
+const OWN = new Set([TOOL, CLEAR, NIGHT].map(n => `mcp__context-watch__${n}`))
 const SAID_SEP = '\n\n<!-- turn -->\n\n'
 
 // The options, from the manifest's userConfig (see the README); defaults filled in.
@@ -139,14 +150,16 @@ let resumedBy: string | undefined
 let spoke = false
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
-const clock = (iso?: string) => (iso ? new Date(iso).toISOString().slice(11, 16) + 'Z' : '?')
+// A time (ISO, or milliseconds) as HH:MMZ.
+const clock = (at?: string | number) => (at ? new Date(at).toISOString().slice(11, 16) + 'Z' : '?')
 
 function windows(u: SessionUsage, lim: Limits = {}, resets = true) {
   return u.rateLimits
     .filter(r => NAMES[r.kind])
     .map(r => {
       const l = lim[r.kind]
-      const notes = [...(l ? [`limit ${l.percent}%`] : []), ...(resets ? [`resets ${clock(r.resetsAt)}`] : [])]
+      const ceiling = l ? [l.night ? `night to ${l.percent}%` : `limit ${l.percent}%`] : []
+      const notes = [...ceiling, ...(resets ? [`resets ${clock(r.resetsAt)}`] : [])]
       return `${NAMES[r.kind]} ${r.percentUsed}%${notes.length ? ` (${notes.join('; ')})` : ''}`
     })
     .join(', ')
@@ -186,18 +199,30 @@ const held = atom({ plugin: 'context-watch', key: 'limits' } as const, null)
 
 async function limits($: Engine): Promise<Limits> {
   const all = (await read($, held)) ?? {}
-  const t = Date.now()
+  const t = await $.clock.now()
   return Object.fromEntries(Object.entries(all).filter(([, l]) => !l.until || Date.parse(l.until) > t))
 }
 
+// The ceilings in force: the limits, and the night's line as the week's when it is lower than the
+// week limit, or there is none. It is flagged night, and gone once the week's window has reset.
+async function ceilings($: Engine): Promise<Limits> {
+  const lim = await limits($)
+  const n = await read($, night)
+  if (!n || (n.weekResets && Date.parse(n.weekResets) <= (await $.clock.now()))) return lim
+  if (lim.seven_day && lim.seven_day.percent <= n.line) return lim
+  return { ...lim, seven_day: { percent: n.line, ...(n.weekResets ? { until: n.weekResets } : {}), night: true } }
+}
+
 // What the model is told of a limit reached: land, say where things stand, start nothing new.
-const stopWords = (name: string, cmd: string, how: string) =>
+// `noun` is what the user raises: a limit, or the night's line.
+const stopWords = (name: string, cmd: string, how: string, noun = 'limit') =>
   `[context-watch] ${name} usage ${how} (/context-watch ${cmd}): land what is in flight (commit, notes), say in a ` +
   "few lines where things stand and what waits, and start nothing new on this plan's usage. The conversation stays " +
-  `as it is; the user raises the limit with /context-watch ${cmd} +N, or off.`
+  `as it is; the user raises the ${noun} with /context-watch ${cmd} +N, or off.`
 
-// A limit reached, crossed since the last reading or already past when the context began: a word
-// to the model, once a context. It never clears: the user may be reading the conversation.
+// A ceiling reached (a limit, or the night's line), crossed since the last reading or already past
+// when the context began: a word to the model, once a context. It never clears: the user may be
+// reading the conversation.
 function limitWords(u: SessionUsage, lim: Limits): string[] {
   const out: string[] = []
   for (const r of u.rateLimits) {
@@ -207,8 +232,9 @@ function limitWords(u: SessionUsage, lim: Limits): string[] {
     if (!l || r.percentUsed < l.percent || told.has(r.kind)) continue
     told.add(r.kind)
     const crossed = before !== undefined && before < l.percent
-    const how = crossed ? `reached its limit, ${l.percent}%` : `${r.percentUsed}% is past its limit, ${l.percent}%`
-    out.push(stopWords(NAMES[r.kind] ?? r.kind, limitCommand(r.kind), how))
+    const what = l.night ? "the night's line" : 'its limit'
+    const how = crossed ? `reached ${what}, ${l.percent}%` : `${r.percentUsed}% is past ${what}, ${l.percent}%`
+    out.push(stopWords(NAMES[r.kind] ?? r.kind, l.night ? NIGHT : limitCommand(r.kind), how, l.night ? 'line' : 'limit'))
   }
   return out
 }
@@ -462,7 +488,8 @@ const FIELDS: Field[] = [
 
 const HOW =
   'Change one: /context-watch <name> <value>, as `target 300k`, `epoch 400k`, `epoch +50k`, `epoch reset`, ' +
-  '`limitweek 44%`, `limitweek +14%`, `5h 50,90`, `status off`, `resume none`. The settings are /config rows too.'
+  '`limitweek 44%`, `limitweek +14%`, `night 96% until 09:30`, `5h 50,90`, `status off`, `resume none`. ' +
+  'The settings are /config rows too.'
 
 // "250k", "1.5m", "250000"; "off", "none" or "0" is 0; "+50k" or "-50k" from `from`. Undefined: no number.
 function tokens(s: string, from: number): number | undefined {
@@ -503,6 +530,7 @@ async function overview($: Engine) {
   const u = await $.session.usage()
   const t = await target($)
   const lim = await limits($)
+  const n = await read($, night)
   const row = (f: Field) => [f.name, f.show(cfg), f.what] as [string, string, string]
   const rows: [string, string, string][] = [
     ...FIELDS.slice(0, 1).map(row),
@@ -510,10 +538,11 @@ async function overview($: Engine) {
     ...FIELDS.slice(1, 4).map(row),
     ['limitweek', showLimit(lim.seven_day), 'stops new work once the week meter reaches it, in this window'],
     ['limit5h', showLimit(lim.five_hour), 'stops new work once the 5-hour meter reaches it, in this window'],
+    ['night', nightLine(n), nightState(n)],
     ...FIELDS.slice(4).map(row),
   ]
   const w = Math.min(16, Math.max(...rows.map(r => r[1].length)))
-  return [now(u, t, lim), ...rows.map(([n, v, what]) => `  ${n.padEnd(10)}${v.padEnd(w)}  ${what}`), HOW].join('\n')
+  return [now(u, t, await ceilings($)), ...rows.map(([n, v, what]) => `  ${n.padEnd(10)}${v.padEnd(w)}  ${what}`), HOW].join('\n')
 }
 
 const showLimit = (l?: Limit) => (l ? `${l.percent}%${l.until ? ` to ${l.until.slice(5, 16).replace('T', ' ')}Z` : ''}` : 'off')
@@ -552,6 +581,290 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   }
 }
 
+// The night: in $.state, so a reload keeps it and finds its resume armed (wakeAt).
+const night = atom({ plugin: 'context-watch', key: 'night' } as const, null)
+const MIN = 60_000
+const RESUME_AFTER = 2 * MIN // a turn that ended under the line
+const RETRY_AFTER = 10 * MIN // after an error, or a spent 5-hour window with no reset time
+const PAST_RESET = 2 * MIN // a spent 5-hour window: this long after its reset
+const RESUMES_AN_HOUR = 8 // this many in the last hour pause the night: a loop
+const CARRY_ON = 'Carrying on the night'
+// A turn's answer that waits on the user or finds nothing ready: a line that starts with either.
+const WAITS = /^[\s>*_#-]*(needs you|nothing ready)\b/im
+const NIGHT_HOW =
+  'night takes a line on the week meter, and a stop time if wanted: /context-watch night 96% until 09:30 (local), ' +
+  '`night 96% for 8h`, `night +3%` (from the meter now), or `night off`.'
+
+// The armed resume; a carry-on sent whose turn has not started; whether the running turn is a
+// carry-on's; the main loop's tool calls this turn (the mod's own not counted); a main-loop turn
+// running (the command arms a resume only when the session is idle).
+let wake: Timer | undefined
+let sentResume = false
+let nightTurn = false
+let calls = 0
+let turnRunning = false
+// The words for the user's next prompt when the user's Esc ended the night; an agent's hold of the
+// resume, logged once.
+let endedNote: string | undefined
+let heldByAgents = false
+
+const hourAgo = (t: number) => (r: string) => Date.parse(r) > t - 60 * MIN
+
+// Why the night is over at `t`, or undefined: the week's window reset, its stop time, or the week
+// meter at its line (or at a lower week limit). No week reading: not over.
+function over(n: Night, u: SessionUsage, lim: Limits, t: number): string | undefined {
+  if (n.weekResets && Date.parse(n.weekResets) <= t) return "the week's window reset"
+  if (n.until && Date.parse(n.until) <= t) return `its stop time, ${clock(n.until)}`
+  const week = u.rateLimits.find(r => r.kind === 'seven_day')
+  const line = lim.seven_day?.percent ?? n.line
+  if (week && week.percentUsed >= line) return `the week meter at ${week.percentUsed}%, its line ${line}%`
+  return undefined
+}
+
+// The prompt that resumes the session: where the meters stand, the user's words, what to do, and
+// how to stop.
+function carryOn(n: Night, u: SessionUsage, lim: Limits) {
+  const at = (kind: string) => u.rateLimits.find(r => r.kind === kind)?.percentUsed
+  const five = at('five_hour')
+  return (
+    `${CARRY_ON} (context-watch): the week meter at ${at('seven_day') ?? '?'}% of its line, ${lim.seven_day?.percent ?? n.line}%` +
+    `${five === undefined ? '' : `, the 5-hour window at ${five}%`}${n.until ? `, until ${clock(n.until)}` : ''}. ` +
+    `Set from the user's words: ${n.words} ${note()}${n.next}\n\n` +
+    'When nothing is ready, or what is left waits on the user, end the turn with a line that starts `Needs you:` or ' +
+    '`Nothing ready:`; the night then pauses until the next prompt.'
+  )
+}
+
+// What the model reads beside the user's prompt after the night ended: what it was, and how to
+// set it again.
+const endedWords = (n: Night, how: string) =>
+  `[context-watch] ${how} (to ${n.line}% of the week${n.until ? `, until ${clock(n.until)}` : ''}), set from: ` +
+  `${n.words}. If the words of the prompt carry the night on, set it again with mcp__context-watch__${NIGHT}.`
+
+function disarm() {
+  wake?.cancel()
+  wake = undefined
+}
+
+// The timer alone, one at a time.
+async function schedule($: Engine, at: number) {
+  const wait = Math.max(0, at - (await $.clock.now()))
+  disarm()
+  wake = $.clock.after(wait, () => void wakeUp($))
+}
+
+// The resume at `at`: written to the night first, so a reload finds it, then the timer.
+async function arm($: Engine, at: number) {
+  await update($, night, n => n && { ...n, wakeAt: new Date(at).toISOString() })
+  await schedule($, at)
+}
+
+async function endNight($: Engine, why: string) {
+  disarm()
+  await update($, night, () => null)
+  await log($, `the night ended: ${why}`)
+}
+
+async function pause($: Engine, why: string) {
+  disarm()
+  await update($, night, n => n && { ...n, paused: why, wakeAt: null })
+  await log($, `the night paused: ${why}`)
+}
+
+// An agent the model or the user started, still at work: its report will start a turn of its own.
+// A plugin's agents (spawnedBy) don't count.
+async function agentsAtWork($: Engine) {
+  try {
+    return (await $.agent.list()).some(a => !a.spawnedBy && ['pending', 'running', 'waiting'].includes(a.status))
+  } catch {
+    return false
+  }
+}
+
+// The armed resume comes due: the carry-on, unless the night is over or paused, or the session is
+// busy (that turn's end arms the next). While an agent is at work, it looks again in 2 minutes.
+async function wakeUp($: Engine) {
+  wake = undefined
+  const n = await read($, night)
+  if (!n || n.paused || running || pending || pendingClear || turnRunning) return
+  const t = await $.clock.now()
+  const u = await $.session.usage()
+  const lim = await ceilings($)
+  const done = over(n, u, lim, t)
+  if (done) return endNight($, done)
+  if (await agentsAtWork($)) {
+    if (!heldByAgents) await log($, 'the night holds its resume while an agent is at work, and looks again every 2 minutes')
+    heldByAgents = true
+    return arm($, t + RESUME_AFTER)
+  }
+  heldByAgents = false
+  const resumes = [...n.resumes.filter(hourAgo(t)), new Date(t).toISOString()]
+  await update($, night, cur => cur && { ...cur, resumes, wakeAt: null })
+  sentResume = true
+  await log($, `the night resumed the session (${resumes.length} in the last hour) | ${now(u, undefined, lim)}`)
+  try {
+    await $.prompt.submit({ text: carryOn(n, u, lim) })
+  } catch (err) {
+    sentResume = false
+    await log($, `the night's carry-on was not taken (${String(err).slice(0, 120)}); trying again in 10 minutes`)
+    await arm($, t + RETRY_AFTER)
+  }
+}
+
+// A main-loop turn ended with a night on (`resumed`: a carry-on's turn; `made`: its tool calls).
+// The night ends, pauses, or arms its next resume, in this order.
+async function afterTurn($: Engine, e: { reason: string; answer: string }, resumed: boolean, made: number) {
+  const n = await read($, night)
+  if (!n || running) return
+  if (e.reason === 'aborted') {
+    endedNote = endedWords(n, 'The user interrupted a turn, which ended the night')
+    return endNight($, 'the user interrupted the turn')
+  }
+  if (n.paused) return
+  const t = await $.clock.now()
+  const u = await $.session.usage()
+  const lim = await ceilings($)
+  const done = over(n, u, lim, t)
+  if (done) return endNight($, done)
+  if (e.reason === 'refusal') return pause($, 'the turn ended in a refusal')
+  const waits = e.answer.match(WAITS)
+  if (waits) return pause($, `the turn ended with "${waits[1]}"`)
+  if (resumed && !made && e.reason === 'answer') return pause($, 'the resumed turn made no tool call')
+  const lastHour = n.resumes.filter(hourAgo(t)).length
+  if (lastHour >= RESUMES_AN_HOUR) return pause($, `${lastHour} resumes in the last hour`)
+  // An error near the 5-hour limit is most likely the limit itself.
+  const five = u.rateLimits.find(r => r.kind === 'five_hour')
+  let at = t + (e.reason === 'error' ? RETRY_AFTER : RESUME_AFTER)
+  let why = e.reason === 'error' ? 'the turn ended on an error' : 'the turn ended under the line'
+  if (five && (five.percentUsed >= Math.min(100, lim.five_hour?.percent ?? 100) || (e.reason === 'error' && five.percentUsed >= 90))) {
+    at = five.resetsAt ? Date.parse(five.resetsAt) + PAST_RESET : t + RETRY_AFTER
+    why = `the 5-hour window is spent (${five.percentUsed}%)`
+  }
+  if (n.until && at >= Date.parse(n.until)) return endNight($, `its next resume would come after its stop time, ${clock(n.until)}`)
+  if (n.weekResets && at >= Date.parse(n.weekResets))
+    return endNight($, `its next resume would come after the week's window resets, ${clock(n.weekResets)}`)
+  await arm($, at)
+  await log($, `the night waits: ${why}; resuming at ${clock(at)}`)
+}
+
+// A stop time, in milliseconds: 09:30 (local, the next one), +8h or +90m from `t`, or an ISO time
+// (with a T). Undefined: none of these.
+function stopTime(raw: string, t: number): number | undefined {
+  const s = raw.trim().toLowerCase()
+  const hm = s.match(/^(\d{1,2}):(\d{2})$/)
+  if (hm) {
+    const [h, m] = [Number(hm[1]), Number(hm[2])]
+    if (h > 23 || m > 59) return undefined
+    const d = new Date(t)
+    d.setHours(h, m, 0, 0)
+    if (d.getTime() <= t) d.setDate(d.getDate() + 1)
+    return d.getTime()
+  }
+  const rel = s.match(/^\+?(\d+(?:\.\d+)?)\s*(h|m|min)$/)
+  if (rel) return t + Number(rel[1]) * (rel[2] === 'h' ? 60 * MIN : MIN)
+  if (!s.includes('t')) return undefined
+  const at = Date.parse(raw.trim())
+  return Number.isNaN(at) ? undefined : at
+}
+
+// Sets the night (the tool and the command). Refused, with why: no week meter, a line out of range
+// or already reached (or a lower week limit reached), a stop time unreadable or past. The last
+// hour's resumes carry over, so setting it again never lifts the cap on them.
+async function setNight($: Engine, o: { line: number; until?: string; words: string; next: string }): Promise<{ text: string } | { refused: string }> {
+  const u = await $.session.usage()
+  const week = u.rateLimits.find(r => r.kind === 'seven_day')
+  if (!week) return { refused: 'no week meter to run to on this plan.' }
+  const line = Math.round(o.line)
+  if (!(line >= 1 && line <= 100)) return { refused: 'the line is a percentage of the week meter, from 1 to 100.' }
+  const lim = await limits($)
+  const below = lim.seven_day && lim.seven_day.percent < line ? lim.seven_day.percent : undefined
+  const ceiling = below ?? line
+  if (week.percentUsed >= ceiling)
+    return { refused: `the week meter is at ${week.percentUsed}% already, at or past ${ceiling}%${below === undefined ? '' : ", this window's week limit"}.` }
+  const t = await $.clock.now()
+  let until: string | null = null
+  if (o.until) {
+    const at = stopTime(o.until, t)
+    if (at === undefined) return { refused: `"${o.until}" is no stop time: 09:30 (local), +8h, +90m, or an ISO time.` }
+    if (at <= t) return { refused: `its stop time, ${clock(at)}, has passed.` }
+    until = new Date(at).toISOString()
+  }
+  disarm()
+  heldByAgents = false
+  await update($, night, before => ({
+    line,
+    until,
+    weekResets: week.resetsAt ?? null,
+    words: o.words,
+    next: o.next,
+    set: new Date(t).toISOString(),
+    resumes: (before?.resumes ?? []).filter(hourAgo(t)),
+    paused: null,
+    wakeAt: null,
+  }))
+  told.delete('seven_day')
+  seen.seven_day = week.percentUsed
+  const to = `to ${line}% of the week (the meter at ${week.percentUsed}%)${until ? `, until ${clock(until)}` : ''}`
+  await log($, `the night set: ${to} | from: ${o.words.slice(0, 200)}`)
+  return {
+    text:
+      `The night runs ${to}${below === undefined ? '' : `; this window's week limit, ${below}%, holds below it`}. A turn ` +
+      "that ends under it is resumed after 2 minutes, at the 5-hour window's reset when that is spent. The user's prompt " +
+      'ends it; a turn that ends with a line starting `Needs you:` or `Nothing ready:` pauses it until the next prompt.',
+  }
+}
+
+const nightLine = (n: Night | null) => (n ? `${n.line}%${n.until ? ` to ${clock(n.until)}` : ''}` : 'off')
+const nightState = (n: Night | null) =>
+  !n
+    ? 'runs the session on to a line on the week meter'
+    : n.paused
+      ? `paused: ${n.paused}, until the next prompt`
+      : n.wakeAt
+        ? `resumes at ${clock(n.wakeAt)}`
+        : 'resumes a turn that ends under it'
+
+// /context-watch night: the night whole; `night 96% [until 09:30 | for 8h]`, `night +3%` or
+// `night off` sets or ends it. Set while the session is idle, it arms a resume: the night starts
+// by itself.
+async function nightCommand($: Engine, raw: string): Promise<{ text: string; context?: string[] }> {
+  const n = await read($, night)
+  const u = await $.session.usage()
+  const week = u.rateLimits.find(r => r.kind === 'seven_day')
+  if (!raw) {
+    if (!n) return { text: `night: off${week ? `; the week meter reads ${week.percentUsed}%` : ''}.` }
+    const t = await $.clock.now()
+    const line = (await ceilings($)).seven_day?.percent ?? n.line
+    return {
+      text: [
+        `night: ${nightLine(n)}, the week meter at ${week?.percentUsed ?? '?'}%` +
+          `${line < n.line ? ` (this window's week limit, ${line}%, holds below it)` : ''}; ${nightState(n)}.`,
+        `  set from: ${n.words}`,
+        `  each resume: ${n.next}`,
+        `  resumes in the last hour: ${n.resumes.filter(hourAgo(t)).length} of at most ${RESUMES_AN_HOUR}`,
+      ].join('\n'),
+    }
+  }
+  if (['off', 'none'].includes(raw.toLowerCase())) {
+    if (!n) return { text: 'night: off.' }
+    await endNight($, 'the user set it off')
+    return { text: 'night: off.', context: ['[context-watch] The user ended the night: no turn is resumed.'] }
+  }
+  const m = raw.match(/^(\+?)(\d+(?:\.\d+)?)%?(?:\s+until\s+(\S+)|\s+for\s+(\S+))?$/i)
+  if (!m) return { text: NIGHT_HOW }
+  if (m[1] && !week) return { text: 'night: no week meter to count from on this plan.' }
+  const t = await $.clock.now()
+  const set = await setNight($, {
+    line: (m[1] ? (week?.percentUsed ?? 0) : 0) + Number(m[2]),
+    until: m[3] ?? (m[4] ? `+${m[4].replace(/^\+/, '')}` : undefined),
+    words: `/context-watch night ${raw}, typed at ${clock(t)}`,
+    next: 'Carry on with the next piece of work.',
+  })
+  if ('refused' in set) return { text: `night: ${set.refused}` }
+  if (!turnRunning) await arm($, t + RESUME_AFTER)
+  return { text: set.text, context: [`[context-watch] The user set a night: ${set.text}`] }
+}
+
 // /context-watch: the settings; `/context-watch <name> <value>` changes one.
 async function command($: Engine, args: string): Promise<{ text: string; context?: string[] }> {
   const name = args.trim().split(/\s+/)[0]?.toLowerCase() ?? ''
@@ -559,6 +872,7 @@ async function command($: Engine, args: string): Promise<{ text: string; context
   if (!name) return { text: await overview($) }
   const kind = LIMITS[name]
   if (kind) return limit($, name, kind, raw)
+  if (name === NIGHT) return nightCommand($, raw)
 
   if (name === 'epoch') {
     const before = await target($)
@@ -644,12 +958,34 @@ export const register: Register = (on, options) => {
         required: ['brief'],
       },
     })
+    await $.tool.register({
+      name: NIGHT,
+      description:
+        'Run the session on to a line on the week meter, unattended: call it when the user names a cap for the ' +
+        'night ("use up to 97% tonight": a line of 96 stops under it). A turn that ends under the line is resumed ' +
+        "by a carry-on prompt after 2 minutes, or at the 5-hour window's reset when that is spent, until the line, " +
+        "the stop time or the week's reset. The user's prompt ends the night; a turn that ends with a line starting " +
+        '`Needs you:` or `Nothing ready:` pauses it until the next prompt. `off` ends it.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          line: { type: 'number', description: "The week meter's percentage to run to." },
+          until: { type: 'string', description: 'A stop time, if the user gave one: 09:30 (local), +8h, +90m, or an ISO time.' },
+          words: { type: 'string', description: "The user's words that set it, quoted, with the time they said them." },
+          next: { type: 'string', description: 'What each resumed turn does: say, take the next ready task.' },
+          off: { type: 'boolean', description: 'End the night.' },
+        },
+      },
+    })
     await $.command.register({
       name: 'context-watch',
       description: "Show or change context-watch's settings, or this context's own suggested clear",
       argumentHint: '[setting value]',
       immediate: true,
     })
+    // A reload cancels the old module's timers: the resume it had armed is armed again.
+    const n = await read($, night)
+    if (n?.wakeAt && !n.paused) await schedule($, Date.parse(n.wakeAt))
     return started
   })
 
@@ -676,10 +1012,24 @@ export const register: Register = (on, options) => {
     return { result: 'Queued: the conversation compacts when this turn ends, then a prompt resumes with `next`. End the turn now.' }
   })
 
+  on('tool.call', { tool: `mcp__context-watch__${NIGHT}` }, async ($, e) => {
+    const input = e as unknown as { line?: unknown; until?: string; words?: string; next?: string; off?: boolean }
+    if (input.off) {
+      const n = await read($, night)
+      if (n) await endNight($, 'the model set it off')
+      return { result: n ? 'The night is off: no turn is resumed.' : 'No night was on.' }
+    }
+    const line = typeof input.line === 'number' ? input.line : typeof input.line === 'string' ? Number.parseFloat(input.line) : Number.NaN
+    if (!Number.isFinite(line) || !input.words || !input.next)
+      return { deny: "context-watch: give `line` (the week meter's percentage), `words` (the user's, with their time) and `next`, or `off`." }
+    const set = await setNight($, { line, until: input.until, words: input.words, next: input.next })
+    return 'refused' in set ? { deny: `context-watch: ${set.refused}` } : { result: set.text }
+  })
+
   on('tool.call', async ($, e, next) => {
     const ran = await next(e)
-    if (e.agentId !== undefined || e.tool === `mcp__context-watch__${TOOL}` || e.tool === `mcp__context-watch__${CLEAR}`)
-      return ran
+    if (e.agentId !== undefined || OWN.has(e.tool)) return ran
+    calls++
     const args = e as unknown as { description?: string; file_path?: string; command?: string }
     recent.push(`${e.tool}: ${(args.description ?? args.file_path ?? args.command ?? '').slice(0, 80)}`)
     if (recent.length > 3) recent.shift()
@@ -687,7 +1037,7 @@ export const register: Register = (on, options) => {
 
     const u = await $.session.usage()
     const t = await target($)
-    const lim = await limits($)
+    const lim = await ceilings($)
     if (cfg.statusLine) $.ui.status(status(u, t, lim))
     const crossed = crossings(u, t)
     const reached = limitWords(u, lim)
@@ -711,11 +1061,44 @@ export const register: Register = (on, options) => {
   })
 
   // Any prompt but the mod's own: typed or queued (the event fires at the user's Enter, mid-turn
-  // too), from the terminal or the phone, or a notice, a peer's message, another mod's.
+  // too), from the terminal, the phone or Slack, or a notice, a peer's message, another mod's.
+  // The user's own ends a night (but /context-watch, which sets it), and the model reads why beside
+  // it; a slash command keeps those words for the next prompt. Any other lifts a night's pause.
   on('prompt.submit', async ($, e, next) => {
     resumedBy = e.origin.kind
-    if (e.origin.kind === 'composer' || e.origin.kind === 'bridge') spoke = true
-    return next(e)
+    const theirs = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'slack-ping'
+    if (theirs) spoke = true
+    if (e.command?.name === 'context-watch') return next(e)
+    const n = await read($, night)
+    if (!theirs) {
+      if (n?.paused) {
+        await update($, night, cur => cur && { ...cur, paused: null })
+        await log($, `the night's pause lifted: a prompt came (${e.origin.kind})`)
+      }
+      return next(e)
+    }
+    if (n) {
+      await endNight($, "the user's prompt")
+      endedNote = endedWords(n, "The user's prompt ended the night")
+    }
+    if (!endedNote || e.command) return next(e)
+    const words = endedNote
+    endedNote = undefined
+    return next({ ...e, context: [...(e.context ?? []), words] })
+  })
+
+  // A main-loop turn begins: whether it is a carry-on's, and the armed resume is dropped (the turn's
+  // own end arms the next).
+  on('turn.start', async ($, e, next) => {
+    const started = await next(e)
+    if (e.agentId !== undefined) return started
+    nightTurn = sentResume && (!e.text || e.text.includes(CARRY_ON))
+    sentResume = false
+    calls = 0
+    turnRunning = true
+    disarm()
+    if ((await read($, night))?.wakeAt) await update($, night, n => n && { ...n, wakeAt: null })
+    return started
   })
 
   on('session.compact', async ($, e, next) => {
@@ -754,15 +1137,17 @@ export const register: Register = (on, options) => {
     )
   })
 
+  // A main-loop turn ends (an agent's end is not the session's): its words are kept, then a queued
+  // compaction or clear runs, else a night decides what comes next.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    if (e.agentId === undefined) {
-      try {
-        const words = await turnWords($)
-        if (words) await remember($, words)
-      } catch (err) {
-        await log($, `the turn's words were not kept: ${String(err).slice(0, 200)}`)
-      }
+    if (e.agentId !== undefined) return done
+    turnRunning = false
+    try {
+      const words = await turnWords($)
+      if (words) await remember($, words)
+    } catch (err) {
+      await log($, `the turn's words were not kept: ${String(err).slice(0, 200)}`)
     }
     if (pending) {
       const p = pending
@@ -774,7 +1159,14 @@ export const register: Register = (on, options) => {
       pendingClear = undefined
       running = true
       $.clock.after(1000, () => void restart($, p))
+    } else {
+      try {
+        await afterTurn($, e, nightTurn, calls)
+      } catch (err) {
+        await log($, `the night missed a turn's end: ${String(err).slice(0, 200)}`)
+      }
     }
+    nightTurn = false
     return done
   })
 }

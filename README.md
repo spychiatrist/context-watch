@@ -5,7 +5,7 @@ A small mod for Claude Code that keeps an eye on two things while you work:
 - how big the conversation's context has grown,
 - how much of your plan's 5-hour and weekly usage you have used.
 
-When either crosses a mark, it tells the model (and logs it). It also gives the model two tools to make room and keep going: compact and continue, or clear and restart from a written brief.
+When either crosses a mark, it tells the model (and logs it). It also gives the model two tools to make room and keep going: compact and continue, or clear and restart from a written brief. And when you hand it the night, it keeps the session working, unattended, up to a line you name on the week meter.
 
 context-watch is free and will stay free. It is a non-commercial project and will never be monetized. MIT licensed.
 
@@ -103,6 +103,35 @@ If the session never goes idle, each tool gives up after about 10 minutes and lo
 
 `resumeNote`, when set, goes into both prompts before the model's own words: something every fresh start should do first, like reading the project's notes.
 
+### The night
+
+A session left to work overnight stops whenever the model ends a turn: a plan that ended early, a handoff written for "the next session". Nothing starts it again until you're back, and the week's usage you meant to spend goes unused. A night keeps it going up to a line on the week meter.
+
+Set one either way:
+
+- `/context-watch night 96% until 09:30`. Also `night 96% for 8h`, `night +3%` (from the meter's reading now), or `night off`. Typed while the session is idle, it starts the session itself two minutes later.
+- The model calls `mcp__context-watch__night` (`line`, `until`, `words`, `next`, or `off`) when you name a cap in your own words ("use up to 97% tonight"). `words` keeps your words and when you said them.
+
+While it's on, each turn of the main session that ends under the line is resumed by a carry-on prompt:
+
+- **Two minutes later**, as a rule.
+- **At the 5-hour window's reset** (plus two minutes) when that window is spent, or past `limit5h`, or an error came with it at 90% or more.
+- **Ten minutes later** after an error, or when the 5-hour reset time is unknown.
+- **Held while an agent is at work**: its report starts a turn of its own. The night looks again every two minutes.
+
+The carry-on names the meters, the line, your words and `next` (with `resumeNote` before it).
+
+It ends at the line, at its stop time, at the week window's reset, or when its next resume would fall after one of those. Your own prompt ends it too: typed, from the phone, or a Slack ping. The model reads why beside your prompt, and how to set it again if your words carry the night on. An Esc that interrupts a turn ends it as well; the model hears that with your next prompt.
+
+It pauses until the next prompt of any kind (a task's report lifts the pause) when:
+
+- a turn ends with a line that starts `Needs you:` or `Nothing ready:` (the carry-on asks the model to write one when it's out of work);
+- a resumed turn makes no tool call;
+- there were eight resumes in the last hour (a loop);
+- the model refused.
+
+Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the session through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
+
 ### The /context-watch command
 
 `/context-watch` shows the settings, the context's reading and how to change them:
@@ -125,6 +154,7 @@ context 120k of 1000k, clear at 250k
 | `step` | `contextStep` | `step 50k` |
 | `5h`, `week` | `fiveHourMarks`, `weeklyMarks` | `week 60,80,95`, `5h none` |
 | `limitweek`, `limit5h` | none: a usage limit for this window, until its meter resets | `limitweek 44%`, `limitweek +14%`, `limit5h off` |
+| `night` | none: the session runs on to a line on the week meter (above) | `night 96% until 09:30`, `night 96% for 8h`, `night +3%`, `night off` |
 | `resume` | `resumeNote` | `resume "Read NOTES.md first."`, `resume none` |
 | `status`, `log` | `statusLine`, `log` | `status off` |
 | `logcap`, `turns`, `data` | `logMaxBytes`, `keepTurns`, `dataDir` | `turns 5` |
@@ -147,11 +177,12 @@ Set `keepTurns: 0` to turn this off.
 
 | Event | What it does |
 | --- | --- |
-| `session.start` | Registers the two tools and `/context-watch`. |
-| `tool.call` (every call) | Reads usage, updates the status line, checks the marks, adds the notice, logs. |
-| `tool.call` (its own two tools) | Checks the input and queues the compaction or clear. |
-| `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later. |
-| `prompt.submit` | Notes that a prompt came, so a compaction doesn't send a second resume prompt; one you typed also drops a queued clear. |
+| `session.start` | Registers the three tools and `/context-watch`; arms a night's waiting resume again. |
+| `tool.call` (every call) | Reads usage, updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice, logs. |
+| `tool.call` (its own three tools) | Checks the input; queues the compaction or clear, or sets the night. |
+| `turn.start` | Notes whether the turn is a night's carry-on; drops a waiting resume (the turn's end arms the next). |
+| `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later, or else lets a night end, pause or arm its next resume. Subagents' turns are ignored. |
+| `prompt.submit` | Notes that a prompt came, so a compaction doesn't send a second resume prompt. One of yours drops a queued clear and ends a night; any other lifts a night's pause. |
 | `session.compact` | Logs the tokens before and after; resets the context marks and the context's own suggested clear. |
 | `command.run` (`/clear`) | Holds the last turn's words for the clear's row; resets the context marks and the context's own suggested clear. |
 | `command.run` (`/context-watch`) | Shows the settings, or changes one. |
@@ -233,6 +264,9 @@ The notices already name the tools. A line in your `CLAUDE.md` makes the habit e
 When context-watch says the context passed the suggested clear, finish the current
 step, land it in files (commit, update the notes), then call clear_and_restart with a brief:
 what to read first, what is in flight, what to do next.
+
+When I name a cap for the night ("use up to 97% tonight"), call context-watch's night
+tool with the line under it, my words and their time, and what to take next.
 ```
 
 ---
@@ -319,6 +353,7 @@ and remove the `context-watch` entry from `pluginConfigs` in `~/.claude/settings
 - **The tools wait for idle.** They run when the turn ends and the session is idle, retrying for about 10 minutes before giving up (logged).
 - **It nudges, it doesn't decide.** The notices are advice to the model. Whether it lands the work and clears depends on the model and your instructions.
 - **Reloads start fresh.** The marks are kept in memory; a reload takes the next reading silently and notices only later crossings.
+- **A night needs the session open.** It resumes a session that is running and idle; it can't start a closed one. A turn that waits on a permission prompt waits for you, night or not. Its line is the account's week meter, which other sessions on the machine spend too: leave them room under the line.
 
 ---
 

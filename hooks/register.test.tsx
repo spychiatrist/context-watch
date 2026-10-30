@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import type { Engine } from 'claude-code/testing'
+import type { Engine, MockClock } from 'claude-code/testing'
 
 // The test environment has timers; the API's types do not declare them.
 declare function setTimeout(fn: () => void, ms: number): unknown
@@ -197,9 +197,14 @@ test('compact_and_continue resumes with next when nobody spoke', async ($, on) =
   expect(sent).toEqual(['Resuming after the compaction you asked for. step two next'])
 })
 
+// The time the worlds below start at: the mod reads its limits' windows by $.clock, and the kit
+// answers a clock only where a world mocks one.
+const JAN = Date.parse('2026-01-01T12:00:00Z')
+
 // The options: the context step and usage marks raise notices, and the log goes to the data folder.
 function meters(on: On, readings: { tokens: number; week: number }[], writes: Record<string, string>) {
   mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
+  mock.clock(on, { now: JAN })
   let i = 0
   on('session.usage', async () => {
     const r = readings[Math.min(i++, readings.length - 1)] ?? { tokens: 0, week: 0 }
@@ -241,10 +246,10 @@ test(
   },
 )
 
-// The suggested clear and /context-watch: a context gauge the test sets, a session, a clear,
-// and the /config rows the command writes through.
+// The suggested clear and /context-watch: a context gauge the test sets, a clock, a session, a
+// clear, and the /config rows the command writes through.
 function gauge(on: On, sets: [string, unknown][] = []) {
-  const g: { tokens: number; percent?: number } = { tokens: 0 }
+  const g: { tokens: number; percent?: number; clock: MockClock } = { tokens: 0, clock: mock.clock(on, { now: JAN }) }
   mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
   on('session.usage', async () => {
     const week = g.percent === undefined ? [] : [{ kind: 'seven_day', percentUsed: g.percent, resetsAt: '2099-01-02T12:00:00Z' }]
@@ -304,8 +309,7 @@ test('/context-watch epoch moves the suggested clear for this context alone', { 
 })
 
 test('/context-watch epoch reset goes back to the target, and a compaction does too', { options: { clearAt: 250_000 } }, async ($, on) => {
-  gauge(on)
-  const clock = mock.clock(on)
+  const { clock } = gauge(on)
   let compacted = false
   on('session.compact', async () => {
     compacted = true
@@ -356,7 +360,7 @@ test('/context-watch shows every setting', { options: { clearAt: 250_000 } }, as
   g.tokens = 120_000
   const text = (await cw($, '')).text ?? ''
   expect(text).toContain('context 120k of 1000k, clear at 250k')
-  for (const name of ['target', 'epoch', 'step', '5h', 'week', 'resume', 'status', 'log', 'logcap', 'turns', 'data'])
+  for (const name of ['target', 'epoch', 'step', '5h', 'week', 'limitweek', 'limit5h', 'night', 'resume', 'status', 'log', 'logcap', 'turns', 'data'])
     expect(text).toMatch(new RegExp(`\\n  ${name} `))
 })
 
@@ -395,8 +399,8 @@ async function call($: Engine) {
 test('limitweek: reached in a turn, the model is told to land and stop, and nothing clears', async ($, on) => {
   const prompts: string[] = []
   const cleared: string[] = []
-  const clock = mock.clock(on)
   const w = meter(on)
+  const clock = w.clock
   on('command.run', { command: 'clear' }, async (_, e) => (cleared.push(e.origin?.kind ?? '?'), { text: '' }))
   on('session.messages', async () => ({ value: TURN }) as never)
   on('prompt.submit', async (_, e) => (prompts.push(e.text), { text: e.text }))
@@ -494,4 +498,320 @@ test('the answer pasted is the one on screen when the clear runs', async ($, on)
   await clock.advance(5000)
   for (let i = 0; i < 100 && !prompts.length; i++) await tick()
   expect(prompts[0]?.endsWith('\n\nThe newer answer.')).toBe(true)
+})
+
+// The night (/context-watch night, the night tool): the session runs on to a line on the week
+// meter. The world: a clock at 03:00Z, the meters as the test sets them, the agents at work, the
+// prompts sent and what rode beside them, the log.
+const T0 = Date.parse('2026-10-30T03:00:00Z')
+const MIN = 60_000
+const LOG = '/home/u/.claude/context-watch.log'
+const WORDS = '"use up to 97% tonight" (his words, 03:00Z)'
+const NEXT = 'Take the next ready task.'
+
+function night(on: On) {
+  const g = { week: 90, five: 10, fiveResets: '2026-10-30T07:00:00Z', weekResets: '2026-10-31T12:00:00Z', agents: [] as unknown[] }
+  const clock = mock.clock(on, { now: T0 })
+  mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
+  const files: Record<string, string> = {}
+  const sent: string[] = []
+  const beside: string[] = []
+  on('session.usage', async () => {
+    const rateLimits = [
+      { kind: 'five_hour', percentUsed: g.five, resetsAt: g.fiveResets },
+      { kind: 'seven_day', percentUsed: g.week, resetsAt: g.weekResets },
+    ]
+    return { value: { context: { tokens: 100_000, window: 1_000_000 }, rateLimits } } as never
+  })
+  on('session.id', async () => ({ value: 's-1' }))
+  on('session.cwd', async () => ({ value: '/home/u/src/p' }))
+  on('session.messages', async () => ({ value: [] }) as never)
+  on('fs.read', async (_, e) => ({ value: files[e.path] ?? '' }))
+  on('fs.write', async (_, e) => ((files[e.path] = e.text), { value: undefined }))
+  on('agent.list', async () => ({ value: g.agents }) as never)
+  on('tool.call', async () => ({ result: 'ok' }) as never)
+  on('ui.status', async () => ({ value: undefined }) as never)
+  on('command.run', { command: 'clear' }, async () => ({ text: '' }))
+  on('prompt.submit', async (_, e) => (sent.push(e.text), beside.push(...(e.context ?? [])), { text: e.text }))
+  on('turn.start', async (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', async () => ({ text: '' }))
+  const later = async (ms: number) => {
+    await clock.advance(ms)
+    for (let i = 0; i < 20; i++) await tick()
+  }
+  return { g, clock, sent, beside, later, log: () => files[LOG] ?? '' }
+}
+
+let turnIds = 0
+// One turn of the main loop (or an agent's): its start with the prompt's text, its tool calls, its end.
+async function turn($: Engine, answer: string, o: { text?: string; tools?: number; reason?: string; agentId?: string } = {}) {
+  const turnId = `t${++turnIds}`
+  const agent = o.agentId ? { agentId: o.agentId } : {}
+  await $.turn.start({ text: o.text ?? 'go', turnId, ...agent } as never)
+  for (let i = 0; i < (o.tools ?? 1); i++) await $.tool.call({ tool: 'Bash', command: 'ls', ...agent } as never)
+  await $.turn.complete({ reason: o.reason ?? 'answer', answer, turnId, durationMs: 1, isAborted: o.reason === 'aborted', ...agent } as never)
+}
+
+const setNight = async ($: Engine, more: Record<string, unknown> = {}) =>
+  (await $.tool.call({ tool: 'mcp__context-watch__night', line: 96, words: WORDS, next: NEXT, ...more } as never)) as { result?: string; deny?: string }
+const his = (text: string) => ({ text, origin: { kind: 'composer' }, wait: false }) as never
+const notice = (text: string) => ({ text, origin: { kind: 'task-notification' }, wait: false }) as never
+
+test('a night resumes a turn that ends under its line, two minutes on, with his words', async ($, on) => {
+  const w = night(on)
+  expect((await setNight($)).result).toContain('The night runs to 96% of the week (the meter at 90%)')
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN - 1000)
+  expect(w.sent).toEqual([])
+  await w.later(1000)
+  expect(w.sent.length).toBe(1)
+  const p = w.sent[0] ?? ''
+  expect(p.startsWith('Carrying on the night')).toBe(true)
+  expect(p).toContain('the week meter at 90% of its line, 96%')
+  expect(p).toContain(WORDS)
+  expect(p).toContain(NEXT)
+  expect(p).toContain('`Needs you:`')
+  expect(w.log()).toContain('the night resumed the session')
+})
+
+test('the resume note rides in every carry-on', { options: { resumeNote: 'Read the notes first.' } }, async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  expect(w.sent[0]).toContain(`Read the notes first. ${NEXT}`)
+})
+
+test('a spent 5-hour window: the resume waits for its reset; an error near it does too', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  w.g.five = 100
+  await turn($, 'Landed P1390.')
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual([])
+  expect(w.log()).toContain('the 5-hour window is spent (100%); resuming at 07:02Z')
+  w.g.five = 0
+  await w.clock.set(Date.parse('2026-10-30T07:02:00Z'))
+  for (let i = 0; i < 20; i++) await tick()
+  expect(w.sent.length).toBe(1)
+
+  w.g.five = 93
+  w.g.fiveResets = '2026-10-30T12:00:00Z'
+  await turn($, '', { text: w.sent[0], reason: 'error', tools: 0 })
+  await w.later(30 * MIN)
+  expect(w.sent.length).toBe(1)
+  expect(w.log()).toContain('the 5-hour window is spent (93%); resuming at 12:02Z')
+})
+
+test('an error well under the 5-hour limit retries in ten minutes', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, '', { reason: 'error', tools: 0 })
+  await w.later(9 * MIN)
+  expect(w.sent).toEqual([])
+  await w.later(MIN)
+  expect(w.sent.length).toBe(1)
+})
+
+test('his prompt ends the night, and the model hears of it', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await $.prompt.submit(his('how is it going?'))
+  expect(w.beside.join(' ')).toContain("The user's prompt ended the night (to 96% of the week)")
+  expect(w.beside.join(' ')).toContain('mcp__context-watch__night')
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual(['how is it going?'])
+  expect((await cw($, 'night')).text).toContain('night: off')
+})
+
+test('a turn that ends waiting on him, or with nothing ready, pauses the night until the next prompt', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.\n\nNeeds you: Q575, the faded damper.')
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual([])
+  expect(w.log()).toContain('the night paused: the turn ended with "Needs you"')
+  await $.prompt.submit(notice('a task finished'))
+  await turn($, 'Read its report.', { text: 'a task finished' })
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(2)
+  expect(w.sent[1]?.startsWith('Carrying on the night')).toBe(true)
+  await turn($, 'Checked.\n\n- **Nothing ready:** the rest waits on him.', { text: w.sent[1] })
+  await w.later(10 * MIN)
+  expect(w.sent.length).toBe(2)
+})
+
+test('his Esc ends the night: a later notice does not start it again, and his next prompt hears why', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, '', { reason: 'aborted' })
+  await $.prompt.submit(notice('a task finished'))
+  await turn($, 'Read its report.', { text: 'a task finished' })
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual(['a task finished'])
+  expect(w.log()).toContain('the night ended: the user interrupted the turn')
+  await $.prompt.submit(his('sorry, go on'))
+  expect(w.beside.join(' ')).toContain('ended the night')
+})
+
+test("the night ends at its line, its stop time and the week's reset", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  w.g.week = 96
+  await turn($, 'Landed P1390.')
+  await w.later(10 * MIN)
+  expect(w.log()).toContain('the night ended: the week meter at 96%, its line 96%')
+
+  w.g.week = 90
+  await setNight($, { until: '2026-10-30T03:30:00Z' })
+  await w.later(30 * MIN)
+  await turn($, 'Landed P1391.')
+  await w.later(10 * MIN)
+  expect(w.log()).toContain('the night ended: its stop time, 03:30Z')
+
+  w.g.weekResets = '2026-10-30T04:00:00Z'
+  await setNight($)
+  await w.later(15 * MIN)
+  await turn($, 'Landed P1392.')
+  await w.later(10 * MIN)
+  expect(w.log()).toContain("the night ended: the week's window reset")
+
+  w.g.weekResets = '2026-10-31T12:00:00Z'
+  w.g.five = 100
+  await setNight($, { until: '2026-10-30T05:00:00Z' })
+  await turn($, 'Landed P1393.')
+  expect(w.log()).toContain('the night ended: its next resume would come after its stop time, 05:00Z')
+  expect(w.sent).toEqual([])
+})
+
+test('a resumed turn that makes no tool call pauses the night; one that works is resumed again', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  await turn($, 'Landed P1391.', { text: w.sent[0] })
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(2)
+  await turn($, 'All done, it seems.', { text: w.sent[1], tools: 0 })
+  await w.later(10 * MIN)
+  expect(w.sent.length).toBe(2)
+  expect(w.log()).toContain('the night paused: the resumed turn made no tool call')
+})
+
+test('eight resumes in an hour pause the night', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed.')
+  for (let i = 0; i < 8; i++) {
+    await w.later(2 * MIN)
+    await turn($, 'Landed another.', { text: w.sent.at(-1) })
+  }
+  await w.later(10 * MIN)
+  expect(w.sent.length).toBe(8)
+  expect(w.log()).toContain('the night paused: 8 resumes in the last hour')
+})
+
+test('an agent at work holds the resume, which comes once it is done', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  w.g.agents = [{ id: 'a1', description: 'a long run', type: 'general-purpose', status: 'running' }]
+  await turn($, 'Waiting on the agent.')
+  await w.later(6 * MIN)
+  expect(w.sent).toEqual([])
+  w.g.agents = [{ id: 'a1', description: 'a long run', type: 'general-purpose', status: 'completed' }]
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(1)
+})
+
+test('a turn that starts in the wait cancels the resume; its own end arms the next', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(MIN)
+  await $.prompt.submit(notice('a task finished'))
+  await $.turn.start({ text: 'a task finished', turnId: 'tn' } as never)
+  await w.later(5 * MIN)
+  expect(w.sent).toEqual(['a task finished'])
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await $.turn.complete({ reason: 'answer', answer: 'Read it.', turnId: 'tn', durationMs: 1, isAborted: false } as never)
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(2)
+})
+
+test("an agent's turn that ends is not the session's: nothing resumes", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'The agent is done.', { agentId: 'a1' })
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual([])
+})
+
+test("a clear queued at a turn's end sends its brief, not a carry-on; the brief's turn carries on", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await $.turn.start({ text: 'go', turnId: 'tc' } as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+  await $.turn.complete({ reason: 'answer', answer: 'Clearing.', turnId: 'tc', durationMs: 1, isAborted: false } as never)
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(1)
+  expect(w.sent[0]).toContain('Starting fresh after the clear')
+  await turn($, 'Landed P1391.', { text: w.sent[0] })
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(2)
+  expect(w.sent[1]?.startsWith('Carrying on the night')).toBe(true)
+})
+
+test('a reload finds the resume due and arms it again, once', async ($, on) => {
+  const w = night(on)
+  on('session.start', async (_, e) => e as never)
+  on('tool.register', async () => ({ value: undefined }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  on('store.delete', async () => ({ value: undefined }) as never)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(MIN)
+  await $.session.start({ cwd: '/home/u/src/p' } as never) // as a reload runs it
+  await w.later(MIN)
+  expect(w.sent.length).toBe(1)
+  await w.later(5 * MIN)
+  expect(w.sent.length).toBe(1)
+})
+
+test('/context-watch night sets, shows and ends a night; set while idle, it starts the session', async ($, on) => {
+  const w = night(on)
+  const set = await cw($, 'night 96% until 2026-10-30T09:30:00Z')
+  expect(set.text).toContain('The night runs to 96% of the week (the meter at 90%), until 09:30Z')
+  expect((await cw($, 'night')).text).toContain('/context-watch night 96% until 2026-10-30T09:30:00Z, typed at 03:00Z')
+  expect((await cw($, '')).text).toMatch(/\n  night +96% to 09:30Z /)
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(1)
+  expect((await cw($, 'night off')).text).toBe('night: off.')
+  expect((await cw($, 'night 80%')).text).toContain('at or past 80%')
+  expect((await cw($, 'night lots')).text).toContain('/context-watch night 96%')
+})
+
+test("the night's line is the week's ceiling: one word to land and stop", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  w.g.week = 95
+  expect(await call($)).toBe('')
+  w.g.week = 96
+  const word = await call($)
+  expect(word).toContain("week usage reached the night's line, 96% (/context-watch night): land what is in flight")
+  expect(word.match(/land what is in flight/g)?.length).toBe(1)
+})
+
+test('a week limit below the line holds: the night runs to it', async ($, on) => {
+  const w = night(on)
+  await cw($, 'limitweek 94%')
+  expect((await setNight($)).result).toContain("this window's week limit, 94%, holds below it")
+  await turn($, 'Landed.')
+  await w.later(2 * MIN)
+  expect(w.sent[0]).toContain('of its line, 94%')
+  w.g.week = 94
+  await turn($, 'Landed more.', { text: w.sent[0] })
+  await w.later(10 * MIN)
+  expect(w.sent.length).toBe(1)
+  expect(w.log()).toContain('the night ended: the week meter at 94%, its line 94%')
 })
