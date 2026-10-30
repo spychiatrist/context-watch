@@ -949,11 +949,14 @@ export const register: Register = (on, options) => {
         'Use it at a seam where the state is all in files (work committed, notes current) and no background agents ' +
         'are running (their reports may not reach the new conversation). It runs when the current turn ends: finish ' +
         'the turn right after calling it. `brief` is the first prompt afterwards: what to read first, what is in ' +
-        'flight, what to do next.',
+        'flight, what to do next. Your last answer is pasted after the brief by itself, so the brief never repeats it.',
       inputSchema: {
         type: 'object',
         properties: {
-          brief: { type: 'string', description: 'The prompt the fresh conversation starts from.' },
+          brief: {
+            type: 'string',
+            description: 'The prompt the fresh conversation starts from; your last answer follows it by itself.',
+          },
         },
         required: ['brief'],
       },
