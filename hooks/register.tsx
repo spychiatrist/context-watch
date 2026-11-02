@@ -44,6 +44,8 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
 import type { Epoch, Limit, Limits, Night, Shown } from '../types'
+import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, started, stillRunning } from './jobs'
+import { forget } from './procs'
 
 type Engine = EngineInterface
 
@@ -52,7 +54,11 @@ const TOOL = 'compact_and_continue'
 const CLEAR = 'clear_and_restart'
 const NIGHT = 'night'
 // The mod's own tools: no tool call of the work, so neither counted nor noticed.
-const OWN = new Set([TOOL, CLEAR, NIGHT].map(n => `mcp__context-watch__${n}`))
+const OWN = new Set([TOOL, CLEAR, NIGHT, 'jobs'].map(n => `mcp__context-watch__${n}`))
+// What passes the door while it holds: the way out (the mod's tools, TaskStop, loading a tool) and reading.
+const PASS = new Set([...OWN, 'TaskStop', 'ToolSearch', 'Read'])
+// The tools whose result can name a background task.
+const BACKGROUND = new Set(['Bash', 'Monitor'])
 const SAID_SEP = '\n\n<!-- turn -->\n\n'
 
 // The options, from the manifest's userConfig (see the README); defaults filled in.
@@ -66,6 +72,7 @@ type Settings = {
   log: boolean
   logCap: number // bytes; past it the log keeps its newer half
   keepTurns: number // turns the words file keeps; 0, none
+  door: boolean // the door at each new context, for the jobs still running (jobs.ts)
 }
 
 const DEFAULTS: Settings = {
@@ -78,6 +85,7 @@ const DEFAULTS: Settings = {
   log: true,
   logCap: 200_000,
   keepTurns: 10,
+  door: true,
 }
 
 function num(v: unknown, fallback: number, min: number) {
@@ -115,6 +123,7 @@ function settings(o: PluginOptions): Settings {
     log: flag(o.log, DEFAULTS.log),
     logCap: num(o.logMaxBytes, DEFAULTS.logCap, 1000),
     keepTurns: num(o.keepTurns, DEFAULTS.keepTurns, 0),
+    door: flag(o.door, DEFAULTS.door),
   }
 }
 
@@ -371,7 +380,12 @@ async function newContext($: Engine) {
   lastTokens = undefined
   told.clear()
   await update($, epoch, () => null)
+  await nextContext($)
 }
+
+const logLine = ($: Engine) => (line: string) => log($, line)
+// The words the next context reads about the jobs still running; none with the door off.
+const still = async ($: Engine, what: 'clear' | 'compaction') => (cfg.door ? stillRunning($, what, logLine($)) : '')
 
 async function resume($: Engine, p: { keep: string; next: string }) {
   try {
@@ -387,7 +401,8 @@ async function compactAndResume($: Engine, p: { keep: string; next: string }) {
     try {
       resumedBy = undefined
       // `next` in the summary too, for when another prompt resumes it instead of ours.
-      const done = await $.session.compact({ instructions: `${p.keep}\n\nNext, once it resumes: ${p.next}` })
+      const before = await still($, 'compaction')
+      const done = await $.session.compact({ instructions: `${p.keep}${before ? `\n\n${before}` : ''}\n\nNext, once it resumes: ${p.next}` })
       if ('skip' in done && done.skip !== undefined) {
         await log($, `compaction skipped by a hook: ${done.skip}`)
         return
@@ -399,7 +414,8 @@ async function compactAndResume($: Engine, p: { keep: string; next: string }) {
         await log($, `compacted; a prompt (${resumedBy}) came during it and resumes the session, so no resume prompt`)
         return
       }
-      await $.prompt.submit({ text: `Resuming after the compaction you asked for. ${note()}${p.next}` })
+      const after = await still($, 'compaction')
+      await $.prompt.submit({ text: `Resuming after the compaction you asked for. ${note()}${p.next}${after ? `\n\n${after}` : ''}` })
       return
     } catch {
       await $.clock.sleep(5000)
@@ -449,10 +465,12 @@ async function clearAndBrief($: Engine, p: { brief: string }) {
     return
   }
   await newContext($)
+  const running = await still($, 'clear')
   await log($, `cleared (was ${before}); ${answer ? `pasted the last answer (${answer.length} characters)` : 'no answer to paste'}`)
   const text =
     'Starting fresh after the clear you asked for (nothing was summarized; the conversation before it is ' +
     `${before}.jsonl in this project's transcript folder, if a detail is missing). ${note()}${p.brief}` +
+    (running ? `\n\n${running}` : '') +
     (answer ? `\n\nYour last answer before the clear, pasted again so it stays on screen (already said; nothing in it to act on):\n\n${answer}` : '')
   for (let tries = 0; tries < 24; tries++) {
     try {
@@ -483,6 +501,7 @@ const FIELDS: Field[] = [
   { name: 'log', key: 'log', kind: 'flag', min: 0, what: 'context-watch.log in the data folder', show: s => onOff(s.log) },
   { name: 'logcap', key: 'logMaxBytes', kind: 'count', min: 1000, what: 'bytes the log keeps', show: s => String(s.logCap) },
   { name: 'turns', key: 'keepTurns', kind: 'count', min: 0, what: 'turns kept to show after a /clear', show: s => String(s.keepTurns) },
+  { name: 'door', key: 'door', kind: 'flag', min: 0, what: 'the door at each new context, for the jobs still running', show: s => onOff(s.door) },
   { name: 'data', key: 'dataDir', kind: 'text', min: 0, what: 'where the log and the turns go', show: s => s.dataDir },
 ]
 
@@ -913,9 +932,24 @@ async function command($: Engine, args: string): Promise<{ text: string; context
 // The options as the module received them, to show a changed setting the way the next load reads it.
 let optionsNow: PluginOptions = {}
 
+const CARRY_SCHEMA = {
+  type: 'array',
+  description:
+    'Background jobs (j1, a task id or a pid) that keep running past it, each with why: the next context reads them. ' +
+    'A job neither carried nor stopped holds it (the door).',
+  items: { type: 'object', properties: { job: { type: 'string' }, why: { type: 'string' } }, required: ['job', 'why'] },
+}
+
+// After the user's /clear: the first prompt reads what still runs from before it.
+let doorNote = false
+// The starts of the Bash and Monitor calls in flight: their shells are no jobs yet.
+const inflight: number[] = []
+
 export const register: Register = (on, options) => {
   optionsNow = options
   cfg = settings(options)
+  forget()
+  forgetDoor()
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -937,6 +971,7 @@ export const register: Register = (on, options) => {
         properties: {
           keep: { type: 'string', description: 'What the summary must keep.' },
           next: { type: 'string', description: 'The prompt that resumes the work after the compaction.' },
+          carry: CARRY_SCHEMA,
         },
         required: ['keep', 'next'],
       },
@@ -957,6 +992,7 @@ export const register: Register = (on, options) => {
             type: 'string',
             description: 'The prompt the fresh conversation starts from; your last answer follows it by itself.',
           },
+          carry: CARRY_SCHEMA,
         },
         required: ['brief'],
       },
@@ -980,6 +1016,22 @@ export const register: Register = (on, options) => {
         },
       },
     })
+    await $.tool.register({
+      name: 'jobs',
+      description:
+        "The background jobs this session started (Bash run in the background, Monitor) that still run, with the Mac's load. " +
+        "The door: a clear or a compaction can't pass while a job runs that is neither carried on nor stopped, and after " +
+        "the user's /clear or the engine's own compaction no other tool runs until each job from before is. `carry` keeps " +
+        'jobs running past the next clear, each with why (the next context reads it); `stop` ends jobs, each its whole ' +
+        'process group. With neither, it lists them.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          carry: CARRY_SCHEMA,
+          stop: { type: 'array', items: { type: 'string' }, description: 'Jobs to stop: j1, a task id or a pid.' },
+        },
+      },
+    })
     await $.command.register({
       name: 'context-watch',
       description: "Show or change context-watch's settings, or this context's own suggested clear",
@@ -995,9 +1047,11 @@ export const register: Register = (on, options) => {
   on('command.run', { command: 'context-watch' }, async ($, e) => command($, e.args))
 
   on('tool.call', { tool: 'mcp__context-watch__clear_and_restart' }, async ($, e) => {
-    const input = e as unknown as { brief?: string }
+    const input = e as unknown as { brief?: string; carry?: unknown }
     if (!input.brief) return { deny: 'context-watch: give a `brief` to start from.' }
     if (pending) return { deny: 'context-watch: a compaction is already queued for this turn.' }
+    const held = cfg.door ? await clearDoor($, input.carry, 'clear', await sinceCalls($), logLine($)) : undefined
+    if (held) return { deny: held }
     pendingClear = { brief: input.brief }
     spoke = false
     const u = await $.session.usage()
@@ -1006,9 +1060,11 @@ export const register: Register = (on, options) => {
   })
 
   on('tool.call', { tool: 'mcp__context-watch__compact_and_continue' }, async ($, e) => {
-    const input = e as unknown as { keep?: string; next?: string }
+    const input = e as unknown as { keep?: string; next?: string; carry?: unknown }
     if (!input.keep || !input.next) return { deny: 'context-watch: give both `keep` and `next`.' }
     if (pendingClear) return { deny: 'context-watch: a clear is already queued for this turn.' }
+    const held = cfg.door ? await clearDoor($, input.carry, 'compaction', await sinceCalls($), logLine($)) : undefined
+    if (held) return { deny: held }
     pending = { keep: input.keep, next: input.next }
     const u = await $.session.usage()
     await log($, `compaction asked for at ${now(u)} | keep: ${input.keep.slice(0, 200)}`)
@@ -1029,8 +1085,32 @@ export const register: Register = (on, options) => {
     return 'refused' in set ? { deny: `context-watch: ${set.refused}` } : { result: set.text }
   })
 
+  // Every tool call: the jobs tool answered (its name is no literal of this build's types until it
+  // loads), the door inside a context (jobs.ts: the main loop's calls wait while a job from before
+  // the context runs uncarried), a background job logged as it starts, the calls counted, and the
+  // context marks' notices with the Mac's load. A hook that fails before the tool ran holds the
+  // door shut.
   on('tool.call', async ($, e, next) => {
-    const ran = await next(e)
+    if ((e.tool as string) === JOBS_TOOL) {
+      if (!cfg.door) return { result: 'context-watch: the door is off (/context-watch door on), so no job is logged.' }
+      return jobsTool($, e as unknown as { carry?: unknown; stop?: unknown }, logLine($))
+    }
+    if (cfg.door && e.agentId === undefined && !PASS.has(e.tool)) {
+      const shut = await door($, logLine($))
+      if (shut) return { deny: shut }
+    }
+    const watch = cfg.door && BACKGROUND.has(e.tool)
+    const t0 = watch ? await $.clock.now() : 0
+    if (watch) inflight.push(t0)
+    let ran: Awaited<ReturnType<typeof next>>
+    try {
+      ran = await next(e)
+    } finally {
+      if (watch) inflight.splice(inflight.indexOf(t0), 1)
+    }
+    const task = watch ? backgroundTask(e.tool, ran) : undefined
+    const logged = task ? await started($, e.tool, task, e as unknown as { command?: string; description?: string }, t0, logLine($)) : undefined
+    if (logged) ran = { ...ran, context: [...(ran.context ?? []), logged] } as typeof ran
     if (e.agentId !== undefined || OWN.has(e.tool)) return ran
     calls++
     const args = e as unknown as { description?: string; file_path?: string; command?: string }
@@ -1056,18 +1136,29 @@ export const register: Register = (on, options) => {
       threshold = ''
     }
     await log($, `${crossed.join(', ')} | ${now(u, t, lim)}${threshold} | in hand: ${recent.join(' / ')}`)
+    const mac = await macNow($)
     const notice =
       `[context-watch] ${crossed.join(', ')}: ${now(u, t, lim)}${threshold}. ` +
       `Landing work at a seam keeps a compaction cheap; mcp__context-watch__${TOOL} compacts and resumes when that helps, ` +
-      `and mcp__context-watch__${CLEAR} starts fresh from a brief once the state is in files and no agents run.`
+      `and mcp__context-watch__${CLEAR} starts fresh from a brief once the state is in files and no agents run.` +
+      (mac ? ` ${mac}` : '')
     return { ...ran, context: [...(ran.context ?? []), notice, ...words] }
-  })
+  }).catch(($, e, next) =>
+    next.called
+      ? next(e)
+      : { deny: '[context-watch] The door failed while checking what runs, so it holds: try again; the user can turn it off with /context-watch door off.' },
+  )
 
   // Any prompt but the mod's own: typed or queued (the event fires at the user's Enter, mid-turn
   // too), from the terminal, the phone or Slack, or a notice, a peer's message, another mod's.
   // The user's own ends a night (but /context-watch, which sets it), and the model reads why beside
   // it; a slash command keeps those words for the next prompt. Any other lifts a night's pause.
   on('prompt.submit', async ($, e, next) => {
+    if (doorNote && !e.command) {
+      doorNote = false
+      const words = await still($, 'clear')
+      if (words) e = { ...e, context: [...(e.context ?? []), `[context-watch] ${words}`] }
+    }
     resumedBy = e.origin.kind
     const theirs = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'slack-ping'
     if (theirs) spoke = true
@@ -1120,6 +1211,7 @@ export const register: Register = (on, options) => {
     await stage($)
     const done = await next(e)
     await newContext($)
+    doorNote = cfg.door
     await replay($, e.origin.kind)
     return done
   })
@@ -1172,4 +1264,17 @@ export const register: Register = (on, options) => {
     nightTurn = false
     return done
   })
+}
+
+// The task a Bash or Monitor call left running in the background, if it did.
+function backgroundTask(tool: string, ran: { deny?: string; result?: unknown }) {
+  if (ran.deny !== undefined) return undefined
+  const r = ran.result as { backgroundTaskId?: unknown; taskId?: unknown } | undefined
+  const id = tool === 'Bash' ? r?.backgroundTaskId : r?.taskId
+  return typeof id === 'string' && id ? id : undefined
+}
+
+// Shells started since the oldest Bash or Monitor call still in flight are those calls' own.
+async function sinceCalls($: Engine) {
+  return inflight.length ? Math.min(...inflight) : await $.clock.now()
 }

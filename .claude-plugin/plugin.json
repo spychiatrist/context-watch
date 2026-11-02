@@ -1,7 +1,7 @@
 {
   "name": "context-watch",
-  "version": "0.6.1",
-  "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, lets it compact or clear itself and carry on, and runs a night on to a line on the week meter; /context-watch shows and changes the settings",
+  "version": "0.7.0",
+  "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, lets it compact or clear itself and carry on, runs a night on to a line on the week meter, and holds a door at each new context for the background jobs still running; /context-watch shows and changes the settings",
   "author": {
     "name": "spychiatrist",
     "url": "https://github.com/spychiatrist"
@@ -69,6 +69,12 @@
       "title": "Resume note",
       "description": "Text put into every prompt that resumes the work after the mod's compaction or clear, before the model's own brief: say, what to read first in every project. Empty: none.",
       "default": ""
+    },
+    "door": {
+      "type": "boolean",
+      "title": "The door at each new context",
+      "description": "Log each background job (Bash run in the background, Monitor) and hold a clear or compaction, and the first tool calls after the user's /clear, until every job still running is carried on (named in the next context, with why) or stopped. The Mac's load shows at the door and at each context mark.",
+      "default": true
     }
   }
 }

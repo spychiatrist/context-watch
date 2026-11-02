@@ -25,8 +25,29 @@ export type Night = {
   wakeAt: string | null // the resume armed
 }
 
+// A background job of the session's: a Bash command run in the background (or sent there), a
+// Monitor, or a Bash shell found running from before the context that no log saw start. Its shell
+// leads a process group of its own: `pid` names the group, and `start` with it the shell itself,
+// as a pid is reused. Times are milliseconds.
+export type Job = {
+  id: string // j1, j2, ...: how the door and the jobs tool name it
+  task: string | null // the engine's task id, for TaskStop
+  tool: string // Bash, Monitor, or found
+  command: string
+  what: string // its description
+  pid: number | null
+  start: number | null
+  context: number // the context it started in
+  carried: { to: number; why: string } | null // carried on into context `to`, and why
+  ended: number | null // when it was stopped or seen gone
+}
+
+// The jobs, and the context they are counted against: each clear and compaction starts the next,
+// at `since`.
+export type Jobs = { context: number; since: number; next: number; list: Job[] }
+
 declare module 'claude-code' {
   interface PluginState {
-    'context-watch': { shown: Shown | null; epoch: Epoch | null; limits: Limits | null; night: Night | null }
+    'context-watch': { shown: Shown | null; epoch: Epoch | null; limits: Limits | null; night: Night | null; jobs: Jobs | null }
   }
 }

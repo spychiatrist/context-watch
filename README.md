@@ -132,6 +132,18 @@ It pauses until the next prompt of any kind (a task's report lifts the pause) wh
 
 Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the session through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
 
+### The door
+
+Background jobs outlive a clear, and the next context can't know they run: two viewer windows a session opened ran for 38 hours behind later clears, until the window server sat at 150% CPU and the Mac could barely log in. The door makes each new context account for them:
+
+- **Each background job is logged as it starts.** That covers a Bash command run in the background (or sent there with Ctrl+B or a timeout) and a Monitor. The log keeps its task id, its shell's pid and its command, in the log file too. A Bash shell found running from before the context that no log saw start is taken in the same way. Claude Code's own helpers (caffeinate, language servers) are not Bash shells, so they never count.
+- **A clear or a compaction waits.** `clear_and_restart` and `compact_and_continue` are refused while a job runs that is neither stopped nor carried on. A job is carried in the call's `carry` (`[{"job": "j1", "why": "the phone check of the menu"}]`), and the next context's first words name it, with why. Each clear asks again.
+- **After a clear the model didn't ask for, the next context waits.** That covers your `/clear` and the engine's own compaction. The model's tool calls are refused until each job from before is carried on or stopped. Only the way out runs: the `jobs` tool, `TaskStop`, `ToolSearch` and `Read`. Your first prompt after a `/clear` gets the list beside it. Subagents' calls pass.
+- **The `jobs` tool** lists what runs, with each job's age, CPU and memory. `carry` keeps jobs running past the next clear; `stop` ends each one's whole process group (SIGTERM, then SIGKILL after 3 s).
+- **The Mac's load** rides with every refusal and every context-mark notice: the load and cores, free memory, the memory pressure, swap, the GPU's use, WindowServer and WindowManager, the busiest processes, and this session's own share. What runs out of line (WindowManager past 1 GB, WindowServer past 80% CPU, memory pressure at warn) leads the line as a check.
+
+If the door can't read the process table, it holds shut rather than letting a job slip by. `/context-watch door off` turns it off. It needs macOS (`ps`, `sysctl`, `ioreg`); on a host that runs no commands it stays off.
+
 ### The /context-watch command
 
 `/context-watch` shows the settings, the context's reading and how to change them:
@@ -177,8 +189,8 @@ Set `keepTurns: 0` to turn this off.
 
 | Event | What it does |
 | --- | --- |
-| `session.start` | Registers the three tools and `/context-watch`; arms a night's waiting resume again. |
-| `tool.call` (every call) | Reads usage, updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice, logs. |
+| `session.start` | Registers the four tools and `/context-watch`; arms a night's waiting resume again. |
+| `tool.call` (every call) | Holds the door after a new context until each job from before is carried on or stopped; logs a background job as it starts; answers the `jobs` tool; reads usage, updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice with the Mac's load, logs. |
 | `tool.call` (its own three tools) | Checks the input; queues the compaction or clear, or sets the night. |
 | `turn.start` | Notes whether the turn is a night's carry-on; drops a waiting resume (the turn's end arms the next). |
 | `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later, or else lets a night end, pause or arm its next resume. Subagents' turns are ignored. |
@@ -287,6 +299,7 @@ Every option is optional. The defaults are what the mod has always done.
 | `log` | boolean | `true` | Write `context-watch.log` in the data folder. |
 | `logMaxBytes` | number | `200000` | Past this size the log keeps its newer half. Minimum 1000. |
 | `keepTurns` | number | `10` | Turns kept per project to show again after a `/clear`. `0` turns that off. |
+| `door` | boolean | `true` | The door at each new context: log each background job, and hold a clear, a compaction, or the first tool calls after your `/clear`, until every job still running is carried on or stopped. |
 
 How to set them:
 
@@ -353,6 +366,7 @@ and remove the `context-watch` entry from `pluginConfigs` in `~/.claude/settings
 - **The tools wait for idle.** They run when the turn ends and the session is idle, retrying for about 10 minutes before giving up (logged).
 - **It nudges, it doesn't decide.** The notices are advice to the model. Whether it lands the work and clears depends on the model and your instructions.
 - **Reloads start fresh.** The marks are kept in memory; a reload takes the next reading silently and notices only later crossings.
+- **The door sees the session's own shells.** A process a foreground command sends off with `&` or `nohup` leaves the session's tree, and so does a job left by a claude that quit. The door doesn't see those yet.
 - **A night needs the session open.** It resumes a session that is running and idle; it can't start a closed one. A turn that waits on a permission prompt waits for you, night or not. Its line is the account's week meter, which other sessions on the machine spend too: leave them room under the line.
 
 ---
