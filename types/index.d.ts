@@ -46,6 +46,8 @@ export type Job = {
 // at `since`.
 export type Jobs = { context: number; since: number; next: number; list: Job[] }
 
+// The jobs, the night and the limits are the window's, in its file (hooks/window.ts): a /clear
+// starts $.state over. $.state holds them only where the host runs no commands.
 declare module 'claude-code' {
   interface PluginState {
     'context-watch': { shown: Shown | null; epoch: Epoch | null; limits: Limits | null; night: Night | null; jobs: Jobs | null }

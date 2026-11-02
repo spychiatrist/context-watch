@@ -6,13 +6,13 @@
 // A Bash shell running from before the context that no log saw start (begun before this mod, or
 // in a lost reload) is found in the process table and held too. Claude's own helpers (caffeinate,
 // the language servers) are no shell of the Bash tool's, so they never count.
-import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { Job, Jobs } from '../types'
 import { claude, size, span, table } from './procs'
 import type { Proc } from './procs'
 import { macLine } from './stats'
+import { keep, kept } from './window'
 
 type Engine = EngineInterface
 type Log = (line: string) => Promise<void>
@@ -21,7 +21,7 @@ export const JOBS_TOOL = 'mcp__context-watch__jobs'
 const LOAD = `ToolSearch "select:${JOBS_TOOL}"`
 const DAY = 24 * 3_600_000
 
-export const jobs = atom({ plugin: 'context-watch', key: 'jobs' } as const, null)
+// The jobs are the window's (window.ts): a /clear starts $.state over, and they outlive it.
 const EMPTY: Jobs = { context: 0, since: 0, next: 1, list: [] }
 
 // One change at a time: parallel tool calls each read the jobs and write them back.
@@ -94,7 +94,7 @@ async function look($: Engine, before: number, log: Log): Promise<Seen | undefin
   if (me === null) return undefined
   const procs = await table($)
   const now = await $.clock.now()
-  const was = (await read($, jobs)) ?? EMPTY
+  const was = (await kept($, 'jobs')) ?? EMPTY
   const lines: string[] = []
   let next = was.next
   const list = was.list.map(j => {
@@ -110,7 +110,7 @@ async function look($: Engine, before: number, log: Log): Promise<Seen | undefin
     lines.push(`j${next - 1} found running from before this context (pid ${p.pid}): ${oneLine(command)}`)
   }
   const state: Jobs = { ...was, next, list: prune(list, now) }
-  if (lines.length) await update($, jobs, () => state)
+  if (lines.length) await keep($, 'jobs', () => state)
   for (const line of lines) await log(line)
   return { state, procs, me, now, live: state.list.filter(j => j.ended === null) }
 }
@@ -146,7 +146,7 @@ async function held($: Engine, seen: Seen, ids: readonly Job[], log: Log) {
 // uncarried, or undefined. Found open once, it stays open for the context.
 export function door($: Engine, log: Log): Promise<string | undefined> {
   return serial(async () => {
-    const was = (await read($, jobs)) ?? EMPTY
+    const was = (await kept($, 'jobs')) ?? EMPTY
     if (openIn === was.context) return undefined
     let seen: Seen | undefined
     try {
@@ -222,7 +222,7 @@ async function apply($: Engine, seen: Seen, carry: readonly Carry[], stop: reado
       await log(`${j.id} stopped${gone ? '' : ' (SIGKILL, may linger)'}`)
     }
   }
-  await update($, jobs, () => ({ ...seen.state, list }))
+  await keep($, 'jobs', () => ({ ...seen.state, list }))
   seen.state = { ...seen.state, list }
   seen.live = list.filter(j => j.ended === null)
   return said
@@ -277,7 +277,7 @@ export function jobsTool($: Engine, input: { carry?: unknown; stop?: unknown }, 
   const carry = carries(input.carry)
   if (typeof carry === 'string') return Promise.resolve({ deny: `context-watch: ${carry}.` })
   return serial(async () => {
-    const was = (await read($, jobs)) ?? EMPTY
+    const was = (await kept($, 'jobs')) ?? EMPTY
     let seen: Seen | undefined
     try {
       seen = await look($, was.since, log)
@@ -321,7 +321,7 @@ export async function started(
     procs = []
   }
   return serial(async () => {
-    const was = (await read($, jobs)) ?? EMPTY
+    const was = (await kept($, 'jobs')) ?? EMPTY
     const now = await $.clock.now()
     const taken = new Set(was.list.filter(j => j.ended === null).map(j => j.pid))
     const fresh = procs.filter(p => isShell(p, me) && p.start >= since - 2000 && !taken.has(p.pid)).sort((a, b) => a.start - b.start)
@@ -338,7 +338,7 @@ export async function started(
       carried: null,
       ended: null,
     }
-    await update($, jobs, () => ({ ...was, next: was.next + 1, list: [...prune(was.list, now), job] }))
+    await keep($, 'jobs', () => ({ ...was, next: was.next + 1, list: [...prune(was.list, now), job] }))
     await log(`${job.id} started (${tool} ${task}, pid ${job.pid ?? '?'}): ${oneLine(job.command)}`)
     return (
       `[context-watch] Logged as ${job.id} (pid ${job.pid ?? '?'}). Stop it once it has served (TaskStop ${task}); ` +
@@ -351,7 +351,7 @@ export async function started(
 // prompt after the user's /clear, a compaction's summary): the carried with why, the rest held.
 export function stillRunning($: Engine, what: 'clear' | 'compaction', log: Log): Promise<string> {
   return serial(async () => {
-    const was = (await read($, jobs)) ?? EMPTY
+    const was = (await kept($, 'jobs')) ?? EMPTY
     let seen: Seen | undefined
     try {
       seen = await look($, was.since, log)
@@ -378,7 +378,7 @@ export function stillRunning($: Engine, what: 'clear' | 'compaction', log: Log):
 // A clear or a compaction starts the next context.
 export async function nextContext($: Engine) {
   const now = await $.clock.now()
-  await serial(() => update($, jobs, j => ({ ...(j ?? EMPTY), context: (j ?? EMPTY).context + 1, since: now })))
+  await serial(() => keep($, 'jobs', j => ({ ...(j ?? EMPTY), context: (j ?? EMPTY).context + 1, since: now })))
 }
 
 // The Mac's line on its own, for a context mark.

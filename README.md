@@ -130,7 +130,7 @@ It pauses until the next prompt of any kind (a task's report lifts the pause) wh
 - there were eight resumes in the last hour (a loop);
 - the model refused.
 
-Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the session through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
+Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the window through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
 
 ### The door
 
@@ -326,8 +326,9 @@ All in the data folder (default `~/.claude`):
 
 - `context-watch.log`: the log described above.
 - `context-watch-said-<project path>.md`: the last turns' words for each project, the project's path with every non-alphanumeric character as `-`.
+- `context-watch-windows/<pid>.json`: what each open window (a `claude` process, by its pid) keeps through its clears: its background jobs, its night and its limits. A `/clear` starts a new session in the same process, and what the mod keeps for a session goes with it, so these live in a file. A window's file is removed when a later session starts after its `claude` has quit.
 
-Both are plain text and stay on your machine. The turn files hold the text of the model's recent answers, so treat them like your transcripts.
+All are plain text and stay on your machine. The turn files hold the text of the model's recent answers, so treat them like your transcripts.
 
 ---
 
@@ -350,7 +351,7 @@ From a clone (Option B):
 Either way, the files it wrote stay until you delete them:
 
 ```sh
-rm ~/.claude/context-watch.log ~/.claude/context-watch-said-*.md
+rm -r ~/.claude/context-watch.log ~/.claude/context-watch-said-*.md ~/.claude/context-watch-windows
 ```
 
 and remove the `context-watch` entry from `pluginConfigs` in `~/.claude/settings.json` if you set options by hand.
@@ -375,7 +376,7 @@ and remove the `context-watch` entry from `pluginConfigs` in `~/.claude/settings
 
 ```sh
 claude plugin validate .   # what the module hooks and calls, and anything Claude Code would refuse
-claude plugin test .       # runs hooks/register.test.tsx against Claude Code's test kit
+claude plugin test .       # runs hooks/*.test.tsx against Claude Code's test kit
 ```
 
 To type-check, load the folder in a session once (Option B or C). Claude Code then writes the API types to `.claude-plugin/types/` (ignored by git), and `tsc -p .` works.
@@ -386,8 +387,10 @@ Layout:
 - `.claude-plugin/marketplace.json`: makes this repo installable with `/plugin install`.
 - `hooks/hooks.json`: names the hooks module.
 - `hooks/register.tsx`: the mod.
-- `hooks/register.test.tsx`: its tests.
-- `types/index.d.ts`: the type of the state it keeps on screen.
+- `hooks/jobs.ts`: the door; `hooks/procs.ts`: the process table; `hooks/stats.ts`: the Mac's load.
+- `hooks/window.ts`: what a window keeps through its clears (the jobs, the night, the limits), in its file.
+- `hooks/register.test.tsx`, `hooks/door.test.tsx`: the tests; `hooks/host.ts`: where they model Claude Code beyond the kit's mocks (a `/clear` starts `$.state` over).
+- `types/index.d.ts`: the types of what it keeps.
 
 ---
 

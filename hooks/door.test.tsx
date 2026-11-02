@@ -5,24 +5,14 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
+import { lstart, ran, sessions } from './host'
+
 // The test environment has timers; the API's types do not declare them.
 declare function setTimeout(fn: () => void, ms: number): unknown
 const tick = () => new Promise<void>(r => setTimeout(r, 2))
 
 const ME = 4351 // the session's claude
 const JAN = Date.parse('2026-01-01T12:00:00Z')
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
-const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
-
-// A time as ps's lstart writes it: local time, the C locale.
-function lstart(ms: number) {
-  const d = new Date(ms)
-  const two = (n: number) => String(n).padStart(2, '0')
-  return (
-    `${DAYS[d.getDay()]} ${MONTHS[d.getMonth()]} ${String(d.getDate()).padStart(2)} ` +
-    `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())} ${d.getFullYear()}`
-  )
-}
 
 type Row = { pid: number; ppid: number; pgid: number; cpu: number; rss: number; start: number; command: string }
 
@@ -49,14 +39,12 @@ const mac = (): Row[] => [
   { pid: 61052, ppid: ME, pgid: ME, cpu: 0.1, rss: 5_700_000, start: JAN - 86_400_000, command: '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clangd --background-index' },
 ]
 
-const ran = (stdout: string, exitCode = 0) =>
-  ({ value: { exitCode, stdout, stderr: exitCode ? 'failed' : '', isStdoutTruncated: false, isStderrTruncated: false } }) as never
-
 type World = { rows: Row[]; kills: string[]; sent: string[]; writes: Record<string, string>; clock: MockClock; tokens: { n: number }; broken: boolean }
 
 // The world beneath the mod: the Mac's commands (ps over `rows`, kill, sysctl, ioreg), a
-// conversation, a clear that clears, a prompt that's taken, and a Bash tool whose background
-// command starts a shell in `rows` and answers with its task at once.
+// conversation, a clear that clears (and starts $.state over, as the host's does), a prompt that's
+// taken, and a Bash tool whose background command starts a shell in `rows` and answers with its
+// task at once.
 function world(on: On, rows: Row[] = mac()): World {
   mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
   const clock = mock.clock(on, { now: JAN })
@@ -73,17 +61,23 @@ function world(on: On, rows: Row[] = mac()): World {
       w.rows = w.rows.filter(r => r.pgid !== group)
       return ran('')
     }
+    if (cmd === '/bin/rm') return (delete w.writes[e.argv[e.argv.length - 1] ?? ''], ran(''))
     if (cmd === '/usr/sbin/sysctl') return ran('{ 2.50 2.40 2.30 }\ntotal = 3072.00M  used = 1024.00M  free = 2048.00M  (encrypted)\n1\n92\n18\n')
     if (cmd === '/usr/sbin/ioreg') return ran('"PerformanceStatistics" = {"Device Utilization %"=7,"Renderer Utilization %"=7}\n')
     return ran('', 1)
   })
   on('session.cwd', async () => ({ value: '/home/u/src/p' }))
-  on('session.id', async () => ({ value: 's-1' }))
+  const host = sessions(on)
   on('session.usage', async () => ({ value: { context: { tokens: w.tokens.n, window: 1_000_000 }, rateLimits: [] } }) as never)
   on('session.messages', async () => ({ value: [] }) as never)
   on('fs.read', async (_, e) => ({ value: w.writes[e.path] ?? '' }))
   on('fs.write', async (_, e) => ((w.writes[e.path] = e.text), { value: undefined }))
-  on('command.run', { command: 'clear' }, async () => ({ text: '' }))
+  on('fs.list', async (_, e) => {
+    const dir = `${e.path ?? ''}/`
+    const names = Object.keys(w.writes).filter(p => p.startsWith(dir)).map(p => p.slice(dir.length))
+    return { value: names.map(name => ({ name, kind: 'file', size: 1, mtimeMs: 0, isLink: false })) } as never
+  })
+  on('command.run', { command: 'clear' }, async () => (host.clear(), { text: '' }))
   on('prompt.submit', async (_, e) => (w.sent.push([e.text, ...(e.context ?? [])].join('\n')), { text: e.text }))
   on('turn.complete', async () => ({ text: '' }))
   on('ui.status', async () => ({ value: undefined }) as never)
@@ -298,4 +292,28 @@ test('a window manager grown huge is flagged', async ($, on) => {
   await call($, { tool: 'Bash', command: 'ls' })
   w.tokens.n = 120_000
   expect(words(await call($, { tool: 'Bash', command: 'ls' }))).toContain('WindowManager at 10.2 GB')
+})
+
+// The window's record (window.ts): a file of its own, named by claude's pid.
+const WINDOWS = '/home/u/.claude/context-watch-windows'
+const record = (pid: number, start: number, jobs: unknown = null) => JSON.stringify({ pid, start, jobs, night: null, limits: null })
+
+test("a session's start removes the records of windows gone, and keeps its own", async ($, on) => {
+  const w = world(on)
+  w.writes[`${WINDOWS}/${ME}.json`] = record(ME, JAN - 7_200_000) // this window's: kept
+  w.writes[`${WINDOWS}/5555.json`] = record(5555, JAN - 60_000) // its claude gone
+  w.writes[`${WINDOWS}/61052.json`] = record(61052, JAN) // its pid another process's now
+  on('session.start', async (_, e) => e as never)
+  on('tool.register', async () => ({ value: undefined }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/home/u/src/p' } as never)
+  expect(Object.keys(w.writes).filter(p => p.startsWith(WINDOWS))).toEqual([`${WINDOWS}/${ME}.json`])
+})
+
+test('a record left by a claude whose pid this one took is not read as its own', async ($, on) => {
+  const w = world(on)
+  const old = { context: 3, since: JAN - 90_000_000, next: 8, list: [] }
+  w.writes[`${WINDOWS}/${ME}.json`] = record(ME, JAN - 90_000_000, old)
+  expect(words(await call($, { tool: 'Bash', command: SERVER, run_in_background: true }))).toContain('Logged as j1 ')
+  expect(JSON.parse(w.writes[`${WINDOWS}/${ME}.json`] ?? '{}').start).toBe(JAN - 7_200_000)
 })

@@ -46,6 +46,7 @@ import type { EngineInterface, PluginOptions, Register, SessionUsage, Timer } fr
 import type { Epoch, Limit, Limits, Night, Shown } from '../types'
 import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, started, stillRunning } from './jobs'
 import { forget } from './procs'
+import { folder, forgetWindow, keep, kept, pruneWindows } from './window'
 
 type Engine = EngineInterface
 
@@ -200,14 +201,14 @@ function now(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
   return w ? `${ctx}; ${w}` : ctx
 }
 
-// The usage limits /context-watch limitweek and limit5h set, by meter: in $.state, so each holds in
-// the window that set it alone (through its clears too), until its meter's window resets.
+// The usage limits /context-watch limitweek and limit5h set, by meter: the window's (window.ts), so
+// each holds in the window that set it alone (through its clears too), until its meter's window
+// resets.
 const LIMITS: Record<string, string> = { limitweek: 'seven_day', limit5h: 'five_hour' }
 const limitCommand = (kind: string) => Object.keys(LIMITS).find(n => LIMITS[n] === kind) ?? kind
-const held = atom({ plugin: 'context-watch', key: 'limits' } as const, null)
 
 async function limits($: Engine): Promise<Limits> {
-  const all = (await read($, held)) ?? {}
+  const all = (await kept($, 'limits')) ?? {}
   const t = await $.clock.now()
   return Object.fromEntries(Object.entries(all).filter(([, l]) => !l.until || Date.parse(l.until) > t))
 }
@@ -216,7 +217,7 @@ async function limits($: Engine): Promise<Limits> {
 // week limit, or there is none. It is flagged night, and gone once the week's window has reset.
 async function ceilings($: Engine): Promise<Limits> {
   const lim = await limits($)
-  const n = await read($, night)
+  const n = await kept($, 'night')
   if (!n || (n.weekResets && Date.parse(n.weekResets) <= (await $.clock.now()))) return lim
   if (lim.seven_day && lim.seven_day.percent <= n.line) return lim
   return { ...lim, seven_day: { percent: n.line, ...(n.weekResets ? { until: n.weekResets } : {}), night: true } }
@@ -250,10 +251,7 @@ function limitWords(u: SessionUsage, lim: Limits): string[] {
 
 // The data folder, a leading ~ expanded; undefined where it needs a home and there is none.
 async function dataDir($: Engine) {
-  const dir = cfg.dataDir
-  if (dir !== '~' && !dir.startsWith('~/')) return dir
-  const home = await $.env.get('HOME')
-  return home ? `${home}${dir.slice(1)}` : undefined
+  return folder($, cfg.dataDir)
 }
 
 async function log($: Engine, line: string) {
@@ -549,7 +547,7 @@ async function overview($: Engine) {
   const u = await $.session.usage()
   const t = await target($)
   const lim = await limits($)
-  const n = await read($, night)
+  const n = await kept($, 'night')
   const row = (f: Field) => [f.name, f.show(cfg), f.what] as [string, string, string]
   const rows: [string, string, string][] = [
     ...FIELDS.slice(0, 1).map(row),
@@ -576,7 +574,7 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   told.delete(kind)
   if (['off', 'none'].includes(raw.toLowerCase())) {
     delete all[kind]
-    await update($, held, () => all)
+    await keep($, 'limits', () => all)
     return { text: `${cmd}: off.`, context: [`[context-watch] The user took the ${name} usage limit off: carry on.`] }
   }
   const m = raw.match(/^(\+?)(\d+(?:\.\d+)?)%?$/)
@@ -585,7 +583,7 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   const percent = Math.round((m[1] ? (r?.percentUsed ?? 0) : 0) + Number(m[2]))
   if (percent < 1 || percent > 100) return { text: `${cmd} is between 1% and 100%.` }
   all[kind] = { percent, ...(r?.resetsAt ? { until: r.resetsAt } : {}) }
-  await update($, held, () => all)
+  await keep($, 'limits', () => all)
   if (r) seen[kind] = r.percentUsed
   const past = r !== undefined && r.percentUsed >= percent
   if (past) told.add(kind)
@@ -600,8 +598,8 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   }
 }
 
-// The night: in $.state, so a reload keeps it and finds its resume armed (wakeAt).
-const night = atom({ plugin: 'context-watch', key: 'night' } as const, null)
+// The night: the window's (window.ts), so it runs on through the clears, and a reload keeps it and
+// finds its resume armed (wakeAt).
 const MIN = 60_000
 const RESUME_AFTER = 2 * MIN // a turn that ended under the line
 const RETRY_AFTER = 10 * MIN // after an error, or a spent 5-hour window with no reset time
@@ -674,19 +672,19 @@ async function schedule($: Engine, at: number) {
 
 // The resume at `at`: written to the night first, so a reload finds it, then the timer.
 async function arm($: Engine, at: number) {
-  await update($, night, n => n && { ...n, wakeAt: new Date(at).toISOString() })
+  await keep($, 'night', n => n && { ...n, wakeAt: new Date(at).toISOString() })
   await schedule($, at)
 }
 
 async function endNight($: Engine, why: string) {
   disarm()
-  await update($, night, () => null)
+  await keep($, 'night', () => null)
   await log($, `the night ended: ${why}`)
 }
 
 async function pause($: Engine, why: string) {
   disarm()
-  await update($, night, n => n && { ...n, paused: why, wakeAt: null })
+  await keep($, 'night', n => n && { ...n, paused: why, wakeAt: null })
   await log($, `the night paused: ${why}`)
 }
 
@@ -704,7 +702,7 @@ async function agentsAtWork($: Engine) {
 // busy (that turn's end arms the next). While an agent is at work, it looks again in 2 minutes.
 async function wakeUp($: Engine) {
   wake = undefined
-  const n = await read($, night)
+  const n = await kept($, 'night')
   if (!n || n.paused || running || pending || pendingClear || turnRunning) return
   const t = await $.clock.now()
   const u = await $.session.usage()
@@ -718,7 +716,7 @@ async function wakeUp($: Engine) {
   }
   heldByAgents = false
   const resumes = [...n.resumes.filter(hourAgo(t)), new Date(t).toISOString()]
-  await update($, night, cur => cur && { ...cur, resumes, wakeAt: null })
+  await keep($, 'night', cur => cur && { ...cur, resumes, wakeAt: null })
   sentResume = true
   await log($, `the night resumed the session (${resumes.length} in the last hour) | ${now(u, undefined, lim)}`)
   try {
@@ -733,7 +731,7 @@ async function wakeUp($: Engine) {
 // A main-loop turn ended with a night on (`resumed`: a carry-on's turn; `made`: its tool calls).
 // The night ends, pauses, or arms its next resume, in this order.
 async function afterTurn($: Engine, e: { reason: string; answer: string }, resumed: boolean, made: number) {
-  const n = await read($, night)
+  const n = await kept($, 'night')
   if (!n || running) return
   if (e.reason === 'aborted') {
     endedNote = endedWords(n, 'The user interrupted a turn, which ended the night')
@@ -810,7 +808,7 @@ async function setNight($: Engine, o: { line: number; until?: string; words: str
   }
   disarm()
   heldByAgents = false
-  await update($, night, before => ({
+  await keep($, 'night', before => ({
     line,
     until,
     weekResets: week.resetsAt ?? null,
@@ -847,7 +845,7 @@ const nightState = (n: Night | null) =>
 // `night off` sets or ends it. Set while the session is idle, it arms a resume: the night starts
 // by itself.
 async function nightCommand($: Engine, raw: string): Promise<{ text: string; context?: string[] }> {
-  const n = await read($, night)
+  const n = await kept($, 'night')
   const u = await $.session.usage()
   const week = u.rateLimits.find(r => r.kind === 'seven_day')
   if (!raw) {
@@ -950,6 +948,7 @@ export const register: Register = (on, options) => {
   cfg = settings(options)
   forget()
   forgetDoor()
+  forgetWindow(cfg.dataDir)
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -959,6 +958,7 @@ export const register: Register = (on, options) => {
     } catch {
       // no store to clean
     }
+    await pruneWindows($)
     await $.tool.register({
       name: TOOL,
       description:
@@ -1039,7 +1039,7 @@ export const register: Register = (on, options) => {
       immediate: true,
     })
     // A reload cancels the old module's timers: the resume it had armed is armed again.
-    const n = await read($, night)
+    const n = await kept($, 'night')
     if (n?.wakeAt && !n.paused) await schedule($, Date.parse(n.wakeAt))
     return started
   })
@@ -1074,7 +1074,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: `mcp__context-watch__${NIGHT}` }, async ($, e) => {
     const input = e as unknown as { line?: unknown; until?: string; words?: string; next?: string; off?: boolean }
     if (input.off) {
-      const n = await read($, night)
+      const n = await kept($, 'night')
       if (n) await endNight($, 'the model set it off')
       return { result: n ? 'The night is off: no turn is resumed.' : 'No night was on.' }
     }
@@ -1163,10 +1163,10 @@ export const register: Register = (on, options) => {
     const theirs = e.origin.kind === 'composer' || e.origin.kind === 'bridge' || e.origin.kind === 'slack-ping'
     if (theirs) spoke = true
     if (e.command?.name === 'context-watch') return next(e)
-    const n = await read($, night)
+    const n = await kept($, 'night')
     if (!theirs) {
       if (n?.paused) {
-        await update($, night, cur => cur && { ...cur, paused: null })
+        await keep($, 'night', cur => cur && { ...cur, paused: null })
         await log($, `the night's pause lifted: a prompt came (${e.origin.kind})`)
       }
       return next(e)
@@ -1191,7 +1191,7 @@ export const register: Register = (on, options) => {
     calls = 0
     turnRunning = true
     disarm()
-    if ((await read($, night))?.wakeAt) await update($, night, n => n && { ...n, wakeAt: null })
+    if ((await kept($, 'night'))?.wakeAt) await keep($, 'night', n => n && { ...n, wakeAt: null })
     return started
   })
 

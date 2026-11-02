@@ -2,6 +2,8 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
+import { claudeAt, sessions } from './host'
+
 // The test environment has timers; the API's types do not declare them.
 declare function setTimeout(fn: () => void, ms: number): unknown
 const tick = () => new Promise<void>(r => setTimeout(r, 2))
@@ -523,7 +525,8 @@ function night(on: On) {
     ]
     return { value: { context: { tokens: 100_000, window: 1_000_000 }, rateLimits } } as never
   })
-  on('session.id', async () => ({ value: 's-1' }))
+  const host = sessions(on)
+  claudeAt(on, 4351, T0 - 3_600_000)
   on('session.cwd', async () => ({ value: '/home/u/src/p' }))
   on('session.messages', async () => ({ value: [] }) as never)
   on('fs.read', async (_, e) => ({ value: files[e.path] ?? '' }))
@@ -531,7 +534,7 @@ function night(on: On) {
   on('agent.list', async () => ({ value: g.agents }) as never)
   on('tool.call', async () => ({ result: 'ok' }) as never)
   on('ui.status', async () => ({ value: undefined }) as never)
-  on('command.run', { command: 'clear' }, async () => ({ text: '' }))
+  on('command.run', { command: 'clear' }, async () => (host.clear(), { text: '' }))
   on('prompt.submit', async (_, e) => (sent.push(e.text), beside.push(...(e.context ?? [])), { text: e.text }))
   on('turn.start', async (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', async () => ({ text: '' }))
@@ -760,6 +763,16 @@ test("a clear queued at a turn's end sends its brief, not a carry-on; the brief'
   await w.later(2 * MIN)
   expect(w.sent.length).toBe(2)
   expect(w.sent[1]?.startsWith('Carrying on the night')).toBe(true)
+})
+
+test('a limit holds through a clear, which starts $.state over: the window keeps it', async ($, on) => {
+  const w = night(on)
+  expect((await cw($, 'limitweek 95%')).text).toContain('limitweek: 95%')
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+  await $.turn.complete({ reason: 'answer', answer: 'Clearing.', turnId: 'tl', durationMs: 1, isAborted: false } as never)
+  await w.later(1000)
+  expect(w.sent[0]).toContain('Starting fresh after the clear')
+  expect((await cw($, 'limitweek')).text).toContain('limitweek: 95%')
 })
 
 test('a reload finds the resume due and arms it again, once', async ($, on) => {
