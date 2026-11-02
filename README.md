@@ -68,6 +68,21 @@ context 201k of 1000k, clear at 250k; 5h 34%, week 41%; resets 18:00
 
 `clear at` shows when a suggested clear is set, with `(this context)` after it when `/context-watch epoch` set the current context's own. Turn the status line off with `statusLine: false`.
 
+### GPT's usage beside Claude's
+
+If the [Codex CLI](https://github.com/openai/codex) is installed and signed in to a ChatGPT plan (say, for a second opinion from GPT), its two meters follow Claude's: the 5 hours, then the week.
+
+```
+context 201k of 1000k, clear at 250k; 5h 34%, week 41%; resets 18:00; GPT 11%/2%
+```
+
+- **Where:** the status line, the notices and the log lines.
+- **How it's read:** `codex app-server`'s `account/rateLimits/read`, which uses none of the plan's allowance. It runs in the background, so no tool call waits on it.
+- **How often:** at most every 5 minutes, and again right after a Bash command that runs `codex`.
+- **The log:** gets a line each time a reading moves: `GPT 11%/2% read (5h resets 01:37Z, week 11-09 06:37Z; plus)`.
+- **Without it:** no codex, signed out, or no answer within 8 seconds: nothing is shown.
+- **Off:** `gptUsage: false`, or `/context-watch gpt off`.
+
 ### The log
 
 Each crossing, compaction and clear is appended to `context-watch.log` in the data folder (default `~/.claude/context-watch.log`). One line each: the time, the working folder, what happened, and the last three tool calls ("in hand"):
@@ -169,6 +184,7 @@ context 120k of 1000k, clear at 250k
 | `night` | none: the session runs on to a line on the week meter (above) | `night 96% until 09:30`, `night 96% for 8h`, `night +3%`, `night off` |
 | `resume` | `resumeNote` | `resume "Read NOTES.md first."`, `resume none` |
 | `status`, `log` | `statusLine`, `log` | `status off` |
+| `gpt` | `gptUsage` | `gpt off` |
 | `logcap`, `turns`, `data` | `logMaxBytes`, `keepTurns`, `dataDir` | `turns 5` |
 
 - Every name but `epoch` writes its `/config` row (`pluginConfigs` in `~/.claude/settings.json`), which reloads the mod. While a compaction or clear is on its way it refuses, as the reload would drop it.
@@ -190,7 +206,7 @@ Set `keepTurns: 0` to turn this off.
 | Event | What it does |
 | --- | --- |
 | `session.start` | Registers the four tools and `/context-watch`; arms a night's waiting resume again. |
-| `tool.call` (every call) | Holds the door after a new context until each job from before is carried on or stopped; logs a background job as it starts; answers the `jobs` tool; reads usage, updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice with the Mac's load, logs. |
+| `tool.call` (every call) | Holds the door after a new context until each job from before is carried on or stopped; logs a background job as it starts; answers the `jobs` tool; reads usage (GPT's in the background, at most every 5 minutes), updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice with the Mac's load, logs. |
 | `tool.call` (its own three tools) | Checks the input; queues the compaction or clear, or sets the night. |
 | `turn.start` | Notes whether the turn is a night's carry-on; drops a waiting resume (the turn's end arms the next). |
 | `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later, or else lets a night end, pause or arm its next resume. Subagents' turns are ignored. |
@@ -295,6 +311,7 @@ Every option is optional. The defaults are what the mod has always done.
 | `weeklyMarks` | string | `"50,75,90"` | Percentages of the weekly usage window that raise a notice. Empty: none. |
 | `resumeNote` | string | `""` | Put into every prompt that resumes after the mod's compaction or clear, before the model's own words. |
 | `statusLine` | boolean | `true` | Show the reading in the status line after each tool call. |
+| `gptUsage` | boolean | `true` | Where the Codex CLI is signed in, GPT's 5-hour and weekly usage follow Claude's (above). Nothing is shown without codex. |
 | `dataDir` | string | `"~/.claude"` | Where the log and the per-project turn files go. Use an absolute path or one starting with `~`; a relative path would land in each project. Created if missing. |
 | `log` | boolean | `true` | Write `context-watch.log` in the data folder. |
 | `logMaxBytes` | number | `200000` | Past this size the log keeps its newer half. Minimum 1000. |
@@ -367,6 +384,7 @@ and remove the `context-watch` entry from `pluginConfigs` in `~/.claude/settings
 - **The tools wait for idle.** They run when the turn ends and the session is idle, retrying for about 10 minutes before giving up (logged).
 - **It nudges, it doesn't decide.** The notices are advice to the model. Whether it lands the work and clears depends on the model and your instructions.
 - **Reloads start fresh.** The marks are kept in memory; a reload takes the next reading silently and notices only later crossings.
+- **GPT's reading leans on an experimental interface.** `codex app-server` is marked experimental, and a Codex release can change it. Then the reading just stops showing.
 - **The door sees the session's own shells.** A process a foreground command sends off with `&` or `nohup` leaves the session's tree, and so does a job left by a claude that quit. The door doesn't see those yet.
 - **A night needs the session open.** It resumes a session that is running and idle; it can't start a closed one. A turn that waits on a permission prompt waits for you, night or not. Its line is the account's week meter, which other sessions on the machine spend too: leave them room under the line.
 
@@ -388,8 +406,9 @@ Layout:
 - `hooks/hooks.json`: names the hooks module.
 - `hooks/register.tsx`: the mod.
 - `hooks/jobs.ts`: the door; `hooks/procs.ts`: the process table; `hooks/stats.ts`: the Mac's load.
+- `hooks/codex.ts`: GPT's usage, read from `codex app-server`.
 - `hooks/window.ts`: what a window keeps through its clears (the jobs, the night, the limits), in its file.
-- `hooks/register.test.tsx`, `hooks/door.test.tsx`: the tests; `hooks/host.ts`: where they model Claude Code beyond the kit's mocks (a `/clear` starts `$.state` over).
+- `hooks/register.test.tsx`, `hooks/door.test.tsx`, `hooks/codex.test.tsx`: the tests; `hooks/host.ts`: where they model Claude Code beyond the kit's mocks (a `/clear` starts `$.state` over).
 - `types/index.d.ts`: the types of what it keeps.
 
 ---

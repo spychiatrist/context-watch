@@ -1,7 +1,7 @@
 {
   "name": "context-watch",
-  "version": "0.7.1",
-  "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, lets it compact or clear itself and carry on, runs a night on to a line on the week meter, and holds a door at each new context for the background jobs still running; /context-watch shows and changes the settings",
+  "version": "0.8.0",
+  "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, lets it compact or clear itself and carry on, shows GPT's usage beside Claude's where the Codex CLI is signed in, runs a night on to a line on the week meter, and holds a door at each new context for the background jobs still running; /context-watch shows and changes the settings",
   "author": {
     "name": "spychiatrist",
     "url": "https://github.com/spychiatrist"
@@ -38,6 +38,12 @@
       "type": "boolean",
       "title": "Status line",
       "description": "Show the context size and usage in the status line after each tool call.",
+      "default": true
+    },
+    "gptUsage": {
+      "type": "boolean",
+      "title": "GPT's usage",
+      "description": "Where the Codex CLI is signed in to a ChatGPT plan, GPT's 5-hour and weekly usage follow Claude's in the status line, the notices and the log (\"GPT 11%/2%\"): read from codex app-server at most every 5 minutes, which spends none of it. No codex, or signed out: nothing shown.",
       "default": true
     },
     "dataDir": {

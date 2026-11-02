@@ -40,10 +40,16 @@
 // /context-watch command shows the settings and changes them: each one for good
 // (the rows /config shows), or the suggested clear for the current context alone,
 // until the next clear or compaction.
+//
+// GPT's usage (gptUsage), where the Codex CLI is signed in to a ChatGPT plan, follows Claude's
+// in the status line, the notices and the log: "GPT 11%/2%", its 5 hours and its week, read in
+// the background at most every 5 minutes (codex.ts), and a log line each time it moves.
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
 import type { Epoch, Limit, Limits, Night, Shown } from '../types'
+import { due, forgetGpt, gptNow, refresh, stale, words as gptWords } from './codex'
+import type { Gpt } from './codex'
 import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, started, stillRunning } from './jobs'
 import { forget } from './procs'
 import { folder, forgetWindow, keep, kept, pruneWindows } from './window'
@@ -74,6 +80,7 @@ type Settings = {
   logCap: number // bytes; past it the log keeps its newer half
   keepTurns: number // turns the words file keeps; 0, none
   door: boolean // the door at each new context, for the jobs still running (jobs.ts)
+  gpt: boolean // GPT's usage after Claude's, read from the Codex CLI (codex.ts)
 }
 
 const DEFAULTS: Settings = {
@@ -87,6 +94,7 @@ const DEFAULTS: Settings = {
   logCap: 200_000,
   keepTurns: 10,
   door: true,
+  gpt: true,
 }
 
 function num(v: unknown, fallback: number, min: number) {
@@ -125,6 +133,7 @@ function settings(o: PluginOptions): Settings {
     logCap: num(o.logMaxBytes, DEFAULTS.logCap, 1000),
     keepTurns: num(o.keepTurns, DEFAULTS.keepTurns, 0),
     door: flag(o.door, DEFAULTS.door),
+    gpt: flag(o.gptUsage, DEFAULTS.gpt),
   }
 }
 
@@ -184,21 +193,55 @@ async function target($: Engine): Promise<Target> {
   return { at: cfg.clearAt, own: false }
 }
 
-// The status line: no reset times but the 5-hour window's, last, in local time.
+// The status line: no reset times but the 5-hour window's, in local time, then GPT's reading.
 function status(u: SessionUsage, t: Target, lim: Limits = {}) {
-  const line = now(u, t, lim, false)
+  const line = claudeNow(u, t, lim, false)
   const at = u.rateLimits.find(r => r.kind === 'five_hour')?.resetsAt
-  if (!at) return line
+  if (!at) return line + gptTail()
   const d = new Date(at)
-  return `${line}; resets ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  return `${line}; resets ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}${gptTail()}`
 }
 
 function now(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
+  return claudeNow(u, t, lim, resets) + gptTail()
+}
+
+function claudeNow(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
   const c = u.context
   let ctx = c.tokens === undefined ? 'context ?' : `context ${k(c.tokens)} of ${k(c.window)}`
   if (t?.at) ctx += `, clear at ${k(t.at)}${t.own ? ' (this context)' : ''}`
   const w = windows(u, lim, resets)
   return w ? `${ctx}; ${w}` : ctx
+}
+
+// GPT's reading after Claude's, while there is one: "; GPT 11%/2%".
+function gptTail() {
+  const g = cfg.gpt ? gptNow() : null
+  return g ? `; ${gptWords(g)}` : ''
+}
+
+// The status line's last drawing, to draw it again with a new reading of GPT's.
+let drawn: Parameters<typeof status> | undefined
+
+// Reads GPT's usage in the background (the tool call never waits on it): a reading that moves is
+// logged, and the status line drawn again with it.
+async function readGpt($: Engine) {
+  const r = await refresh($)
+  if (!r) return
+  const { before, after } = r
+  if (after?.five === before?.five && after?.week === before?.week) return
+  if (after) await log($, gptLine(after))
+  if (cfg.statusLine && drawn) $.ui.status(status(...drawn))
+}
+
+// The log's line for a reading: "GPT 11%/2% read (5h resets 01:37Z, week 11-09 06:37Z; plus)".
+function gptLine(g: Gpt) {
+  const resets = [
+    ...(g.fiveResets ? [`5h resets ${clock(g.fiveResets)}`] : []),
+    ...(g.weekResets ? [`week ${new Date(g.weekResets).toISOString().slice(5, 16).replace('T', ' ')}Z`] : []),
+  ].join(', ')
+  const about = [resets, g.plan ?? ''].filter(Boolean).join('; ')
+  return `${gptWords(g)} read${about ? ` (${about})` : ''}`
 }
 
 // The usage limits /context-watch limitweek and limit5h set, by meter: the window's (window.ts), so
@@ -496,6 +539,7 @@ const FIELDS: Field[] = [
   { name: 'week', key: 'weeklyMarks', kind: 'marks', min: 0, what: 'weekly usage marks (%)', show: s => s.marks.seven_day?.join(',') || 'none' },
   { name: 'resume', key: 'resumeNote', kind: 'text', min: 0, what: 'put into every resume prompt', show: s => (s.resumeNote ? `"${cut(s.resumeNote, 14)}"` : 'none') },
   { name: 'status', key: 'statusLine', kind: 'flag', min: 0, what: 'the status line', show: s => onOff(s.statusLine) },
+  { name: 'gpt', key: 'gptUsage', kind: 'flag', min: 0, what: "GPT's usage after Claude's, from the Codex CLI", show: s => onOff(s.gpt) },
   { name: 'log', key: 'log', kind: 'flag', min: 0, what: 'context-watch.log in the data folder', show: s => onOff(s.log) },
   { name: 'logcap', key: 'logMaxBytes', kind: 'count', min: 1000, what: 'bytes the log keeps', show: s => String(s.logCap) },
   { name: 'turns', key: 'keepTurns', kind: 'count', min: 0, what: 'turns kept to show after a /clear', show: s => String(s.keepTurns) },
@@ -948,6 +992,8 @@ export const register: Register = (on, options) => {
   cfg = settings(options)
   forget()
   forgetDoor()
+  forgetGpt()
+  drawn = undefined
   forgetWindow(cfg.dataDir)
 
   on('session.start', async ($, e, next) => {
@@ -1117,11 +1163,15 @@ export const register: Register = (on, options) => {
     recent.push(`${e.tool}: ${(args.description ?? args.file_path ?? args.command ?? '').slice(0, 80)}`)
     if (recent.length > 3) recent.shift()
     if ('deny' in ran && ran.deny !== undefined) return ran
+    // A codex command may have spent GPT's usage: read it again now.
+    if (e.tool === 'Bash' && /\bcodex\b/.test(args.command ?? '')) stale()
 
     const u = await $.session.usage()
     const t = await target($)
     const lim = await ceilings($)
+    drawn = [u, t, lim]
     if (cfg.statusLine) $.ui.status(status(u, t, lim))
+    if (cfg.gpt && due(await $.clock.now())) void readGpt($).catch(() => undefined)
     const crossed = crossings(u, t)
     const reached = limitWords(u, lim)
     if (reached.length) await log($, `${reached.join(' ').slice(0, 300)} | ${now(u, t, lim)}`)
