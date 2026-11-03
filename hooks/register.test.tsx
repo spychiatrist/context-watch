@@ -512,13 +512,24 @@ const WORDS = '"use up to 97% tonight" (his words, 03:00Z)'
 const NEXT = 'Take the next ready task.'
 
 function night(on: On) {
-  const g = { week: 90, five: 10, fiveResets: '2026-10-30T07:00:00Z', weekResets: '2026-10-31T12:00:00Z', agents: [] as unknown[] }
+  const g = {
+    week: 90,
+    five: 10,
+    fiveResets: '2026-10-30T07:00:00Z',
+    weekResets: '2026-10-31T12:00:00Z',
+    agents: [] as unknown[],
+    gate: undefined as Promise<void> | undefined,
+  }
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
   const files: Record<string, string> = {}
   const sent: string[] = []
   const beside: string[] = []
   on('session.usage', async () => {
+    // A reading held at the gate (hold, below) answers once the test opens it.
+    const gate = g.gate
+    g.gate = undefined
+    if (gate) await gate
     const rateLimits = [
       { kind: 'five_hour', percentUsed: g.five, resetsAt: g.fiveResets },
       { kind: 'seven_day', percentUsed: g.week, resetsAt: g.weekResets },
@@ -538,11 +549,20 @@ function night(on: On) {
   on('prompt.submit', async (_, e) => (sent.push(e.text), beside.push(...(e.context ?? [])), { text: e.text }))
   on('turn.start', async (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', async () => ({ text: '' }))
+  // An API error that ends a turn: no settings hook of the user's answers it.
+  on('classic.StopFailure', async () => ({}))
   const later = async (ms: number) => {
     await clock.advance(ms)
     for (let i = 0; i < 20; i++) await tick()
   }
-  return { g, clock, sent, beside, later, log: () => files[LOG] ?? '' }
+  // Holds the next reading of the meters until the function it returns is called: a resume that comes
+  // due waits there, mid-flight, while the test sends what arrives meanwhile.
+  const hold = () => {
+    let open: (v: void) => void = () => undefined
+    g.gate = new Promise<void>(r => (open = r))
+    return () => open()
+  }
+  return { g, clock, files, sent, beside, later, hold, log: () => files[LOG] ?? '' }
 }
 
 let turnIds = 0
@@ -614,6 +634,322 @@ test('an error well under the 5-hour limit retries in ten minutes', async ($, on
   expect(w.sent).toEqual([])
   await w.later(MIN)
   expect(w.sent.length).toBe(1)
+})
+
+// A main-loop turn that ends on an API error, the engine's word for it (StopFailure's) heard before
+// the turn's end, or after it (`late`): which comes first is the engine's to decide.
+async function failing($: Engine, error: string, o: { text?: string; late?: boolean } = {}) {
+  const turnId = `t${++turnIds}`
+  await $.turn.start({ text: o.text ?? 'go', turnId } as never)
+  if (!o.late) await $.classic.StopFailure({ error } as never)
+  await $.turn.complete({ reason: 'error', answer: '', turnId, durationMs: 1, isAborted: false } as never)
+  if (o.late) await $.classic.StopFailure({ error } as never)
+}
+const carryOns = (sent: string[]) => sent.filter(p => p.startsWith('Carrying on the night'))
+// The whole carry-on: his words and `next`, which the short one never repeats.
+const whole = (p?: string) => !!p?.includes(WORDS) && p.includes(NEXT)
+
+// 11-03: the plan lapsed at 03:49Z, and every resume, six an hour, sent the whole carry-on into a turn
+// that failed at once; 19 copies reached the model together when the plan came back at 07:02Z.
+test('turns that keep ending on an error back off, 10, 20, 40 minutes, then hourly: the whole carry-on once a run', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await failing($, 'overloaded')
+  await w.later(10 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(whole(w.sent[0])).toBe(true)
+  for (const wait of [20, 40, 60, 60]) {
+    await failing($, 'overloaded', { text: w.sent.at(-1) })
+    const before = w.sent.length
+    await w.later(wait * MIN - 1000)
+    expect(w.sent.length).toBe(before)
+    await w.later(1000)
+    expect(w.sent.length).toBe(before + 1)
+  }
+  const run = carryOns(w.sent)
+  expect(run.length).toBe(5)
+  expect(run.filter(p => whole(p)).length).toBe(1)
+  expect(run[1]).toContain('2 turns in a row ended on an error (overloaded), the first at 03:00Z')
+  expect(w.log()).toContain('3 turns in a row ended on an error (overloaded), the first at 03:00Z; resuming at 04:10Z with the short carry-on')
+  expect(w.log()).toContain('the night resumed the session (2 in the last hour, the short carry-on)')
+  // A turn that ends well ends the run: the next carry-on is whole, two minutes on.
+  await turn($, 'Landed P1391.', { text: w.sent.at(-1) })
+  await w.later(2 * MIN)
+  expect(w.sent.length).toBe(6)
+  expect(whole(w.sent.at(-1))).toBe(true)
+})
+
+test("an error that won't clear by itself: once a resume fails too, nothing more is sent until a turn ends well", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  // The plan lapsed: the turn, then a task's report, each ended on the error, as at 03:49Z on 11-03.
+  await failing($, 'oauth_org_not_allowed')
+  await $.prompt.submit(notice('a task finished'))
+  await failing($, 'oauth_org_not_allowed', { text: 'a task finished' })
+  await w.later(20 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(whole(carryOns(w.sent)[0])).toBe(true)
+  await failing($, 'oauth_org_not_allowed', { text: carryOns(w.sent)[0] })
+  await w.later(4 * 60 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(w.log()).toContain("the night paused: a resume failed, and the turn ended on an error that won't clear by itself (oauth_org_not_allowed)")
+  // Another report's turn ends well: the night runs on, its carry-on whole again.
+  await $.prompt.submit(notice('another task finished'))
+  await turn($, 'Read its report.', { text: 'another task finished' })
+  await w.later(2 * MIN)
+  expect(carryOns(w.sent).length).toBe(2)
+  expect(whole(carryOns(w.sent)[1])).toBe(true)
+})
+
+// The engine may name a turn's error after the turn's end, once the night has armed its retry: the
+// night decides then, not when the retry comes due.
+test("an error named after its turn's end decides then: one that won't clear pauses the night at once", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  await failing($, 'billing_error', { text: w.sent[0], late: true })
+  expect(w.log()).toContain("won't clear by itself (billing_error)")
+  expect((await cw($, 'night')).text).toContain("paused: a resume failed, and the turn ended on an error that won't clear by itself (billing_error)")
+  await w.later(60 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+})
+
+// A turn's error is its own, never the run's last: after a pause on billing_error, a report's turn
+// that fails on an error that may clear (or one never named) backs off. The same whichever the engine
+// says first, the turn's end or its error (11-03's log showed neither order).
+for (const [then, late] of [
+  ['overloaded', false],
+  ['overloaded', true],
+  ['unknown', false],
+  ['unknown', true],
+  [null, false],
+] as const)
+  test(`a turn's error is its own: after billing_error, ${then ? `${then} named ${late ? 'after' : 'before'} the turn's end` : 'an error never named'} backs off`, async ($, on) => {
+    const w = night(on)
+    await setNight($)
+    await turn($, 'Landed P1390.')
+    await w.later(2 * MIN)
+    await failing($, 'billing_error', { text: w.sent[0], late })
+    await w.later(10 * MIN)
+    expect(w.log()).toContain("won't clear by itself (billing_error)")
+    await $.prompt.submit(notice('a task finished'))
+    if (then) await failing($, then, { text: 'a task finished', late })
+    else await turn($, '', { text: 'a task finished', reason: 'error', tools: 0 })
+    const shown = (await cw($, 'night')).text ?? ''
+    expect(shown).toContain('resumes at 03:32Z')
+    expect(shown).toContain(`errors: 2 turns in a row ended on an error${then ? ` (${then})` : ''}, the first at 03:02Z`)
+    if (late) expect(w.log()).toContain(`the turn's error, named after its end: ${then}; the resume at 03:32Z stands`)
+    await w.later(20 * MIN)
+    expect(carryOns(w.sent).length).toBe(2)
+    expect(whole(carryOns(w.sent)[1])).toBe(false)
+  })
+
+// A resume that comes due reads the meters, the agents and the night, each an await: what arrives
+// meanwhile is heard before the carry-on goes, never after (hold: the reading waits at a gate).
+test("a resume caught mid-read sends nothing once a report's prompt has come; its turn's end resumes", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  const open = w.hold()
+  await w.later(2 * MIN)
+  await $.prompt.submit(notice('a task finished'))
+  open()
+  await w.later(0)
+  expect(carryOns(w.sent)).toEqual([])
+  await $.turn.start({ text: 'a task finished', turnId: 'tr' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'ls' } as never)
+  await $.turn.complete({ reason: 'answer', answer: 'Read its report.', turnId: 'tr', durationMs: 1, isAborted: false } as never)
+  await w.later(2 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+})
+
+test('a resume caught mid-read sends nothing once his prompt has ended the night', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  const open = w.hold()
+  await w.later(2 * MIN)
+  await $.prompt.submit(his('how is it going?'))
+  open()
+  await w.later(10 * MIN)
+  expect(w.sent).toEqual(['how is it going?'])
+})
+
+test("a resume caught mid-read hears an error named meanwhile: one that won't clear pauses the night", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  // The carry-on's turn fails, and the engine names its error only as the retry comes due.
+  await turn($, '', { text: w.sent[0], reason: 'error', tools: 0 })
+  const open = w.hold()
+  await w.later(10 * MIN)
+  await $.classic.StopFailure({ error: 'billing_error' } as never)
+  open()
+  await w.later(60 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(w.log()).toContain("won't clear by itself (billing_error)")
+})
+
+test('a resume caught mid-read by an error named meanwhile that may clear still goes, once', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  await turn($, '', { text: w.sent[0], reason: 'error', tools: 0 })
+  const open = w.hold()
+  await w.later(10 * MIN)
+  await $.classic.StopFailure({ error: 'overloaded' } as never)
+  open()
+  await w.later(MIN)
+  expect(carryOns(w.sent).length).toBe(2)
+  expect(whole(carryOns(w.sent)[1])).toBe(false)
+  await w.later(60 * MIN)
+  expect(carryOns(w.sent).length).toBe(2)
+})
+
+// A hold on an error that won't clear is the run's, so the window's: a new context starts over only
+// whether the whole carry-on is in the conversation.
+test("a hold on an error that won't clear outlives a compaction in a report's turn that fails the same way", async ($, on) => {
+  const w = night(on)
+  on('session.compact', async () => ({ messages: [{ role: 'user', text: 'the summary', toolUses: [] }], tokensBefore: 900_000, tokensAfter: 40_000 }) as never)
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  await failing($, 'billing_error', { text: w.sent[0] })
+  expect(w.log()).toContain("won't clear by itself (billing_error)")
+  await $.prompt.submit(notice('a task finished'))
+  await $.turn.start({ text: 'a task finished', turnId: 'tc' } as never)
+  await $.session.compact({ trigger: 'auto', messages: [{ role: 'user', text: 'the night so far', toolUses: [] }] } as never)
+  await $.classic.StopFailure({ error: 'billing_error' } as never)
+  await $.turn.complete({ reason: 'error', answer: '', turnId: 'tc', durationMs: 1, isAborted: false } as never)
+  expect(w.log()).toContain('compacted (auto)')
+  await w.later(60 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect((await cw($, 'night')).text).toContain('paused: a resume failed')
+})
+
+// The run is the window's, with the night: a clear starts $.state over (host.ts), and the API's
+// trouble goes on. The cleared conversation holds no carry-on, so its first is whole. Each main-loop
+// turn is counted, the one that queued the clear too.
+test('a run of errors outlives a clear; the cleared conversation gets the whole carry-on once', async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await failing($, 'overloaded')
+  await w.later(10 * MIN)
+  await failing($, 'overloaded', { text: w.sent[0] })
+  await w.later(20 * MIN)
+  expect(whole(w.sent[1])).toBe(false)
+  // The short carry-on's turn queues a clear, then ends on an error; the brief's turn fails too.
+  await $.turn.start({ text: w.sent[1], turnId: 'tq' } as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+  await $.classic.StopFailure({ error: 'overloaded' } as never)
+  await $.turn.complete({ reason: 'error', answer: '', turnId: 'tq', durationMs: 1, isAborted: false } as never)
+  await w.later(1000)
+  expect(w.sent.at(-1)).toContain('Starting fresh after the clear')
+  await failing($, 'overloaded', { text: w.sent.at(-1) })
+  expect(w.log()).toContain('4 turns in a row ended on an error (overloaded), the first at 03:00Z; resuming at 04:30Z')
+  await w.later(60 * MIN)
+  expect(carryOns(w.sent).length).toBe(3)
+  expect(whole(w.sent.at(-1))).toBe(true)
+})
+
+test("a turn that queues a clear and ends well ends the run; the brief's error starts a new one", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await failing($, 'overloaded')
+  await w.later(10 * MIN)
+  await $.turn.start({ text: w.sent[0], turnId: 'tq' } as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+  await $.turn.complete({ reason: 'answer', answer: 'Clearing.', turnId: 'tq', durationMs: 1, isAborted: false } as never)
+  await w.later(1000)
+  expect(w.sent.at(-1)).toContain('Starting fresh after the clear')
+  await failing($, 'overloaded', { text: w.sent.at(-1) })
+  expect(w.log()).toContain('the night waits: the turn ended on an error (overloaded); resuming at 03:20Z')
+})
+
+test("his Esc in a turn that queued a clear ends the night: the brief's turn is not resumed", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  await $.turn.start({ text: 'go', turnId: 'te' } as never)
+  await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+  await $.turn.complete({ reason: 'aborted', answer: '', turnId: 'te', durationMs: 1, isAborted: true } as never)
+  await w.later(1000)
+  expect(w.sent.at(-1)).toContain('Starting fresh after the clear')
+  await turn($, 'Landed P1391.', { text: w.sent.at(-1) })
+  await w.later(10 * MIN)
+  expect(carryOns(w.sent)).toEqual([])
+  expect(w.log()).toContain('the night ended: the user interrupted the turn')
+})
+
+// A queued clear's brief goes whatever its turn ended on, and the brief's turn decides: the same
+// whichever the engine says first, that turn's end or its error.
+for (const late of [false, true])
+  test(`an error that won't clear, named ${late ? 'after' : 'before'} the end of a turn that queued a clear: the brief's turn decides`, async ($, on) => {
+    const w = night(on)
+    await setNight($)
+    await turn($, 'Landed P1390.')
+    await w.later(2 * MIN)
+    await failing($, 'billing_error', { text: w.sent[0] })
+    await $.prompt.submit(notice('a task finished'))
+    await $.turn.start({ text: 'a task finished', turnId: 'tq' } as never)
+    await $.tool.call({ tool: 'mcp__context-watch__clear_and_restart', brief: 'carry on from the brief' } as never)
+    if (!late) await $.classic.StopFailure({ error: 'billing_error' } as never)
+    await $.turn.complete({ reason: 'error', answer: '', turnId: 'tq', durationMs: 1, isAborted: false } as never)
+    if (late) await $.classic.StopFailure({ error: 'billing_error' } as never)
+    await w.later(1000)
+    expect(w.sent.at(-1)).toContain('Starting fresh after the clear')
+    await turn($, 'Landed P1391.', { text: w.sent.at(-1) })
+    await w.later(2 * MIN)
+    expect(carryOns(w.sent).length).toBe(2)
+    expect(whole(carryOns(w.sent)[1])).toBe(true)
+  })
+
+// A night 0.8.0 kept, which has no run of errors, read by a fresh module as a reload's is (the kit
+// loads the module afresh for each test): it resumes when due, and its first error starts a run.
+const WINDOW = '/home/u/.claude/context-watch-windows/4351.json'
+test('a night kept by 0.8.0 resumes after a reload, and its first error starts a run', async ($, on) => {
+  const w = night(on)
+  const kept = {
+    line: 96,
+    until: null,
+    weekResets: '2026-10-31T12:00:00Z',
+    words: WORDS,
+    next: NEXT,
+    set: '2026-10-30T02:40:00.000Z',
+    resumes: ['2026-10-30T02:58:00.000Z'],
+    paused: null,
+    wakeAt: '2026-10-30T03:02:00.000Z',
+  }
+  w.files[WINDOW] = JSON.stringify({ pid: 4351, start: T0 - 3_600_000, jobs: null, night: kept, limits: null })
+  on('session.start', async (_, e) => e as never)
+  on('tool.register', async () => ({ value: undefined }) as never)
+  on('command.register', async () => ({ value: undefined }) as never)
+  on('store.delete', async () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/home/u/src/p' } as never)
+  await w.later(2 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(whole(w.sent[0])).toBe(true)
+  await failing($, 'overloaded', { text: w.sent[0] })
+  expect(w.log()).toContain('the night waits: the turn ended on an error (overloaded); resuming at 03:12Z with the short carry-on')
+  await w.later(10 * MIN)
+  expect(carryOns(w.sent).length).toBe(2)
+  expect(whole(w.sent[1])).toBe(false)
+  const errors = (JSON.parse(w.files[WINDOW] ?? '{}') as { night?: { errors?: unknown } }).night?.errors
+  expect(errors).toEqual({ since: '2026-10-30T03:02:00.000Z', turns: 1, held: true, whole: true, kind: 'overloaded' })
+})
+
+// clock() wrote HH:MMZ alone, so `week 0% (resets 12:00Z)` never said which day (11-03, on Ultra).
+test('a reset more than a day away says its day; one within a day, its time alone', async ($, on) => {
+  const w = night(on)
+  expect((await cw($, '')).text).toContain('5h 10% (resets 07:00Z), week 90% (resets 10-31 12:00Z)')
+  await setNight($)
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  expect(w.log()).toContain('week 90% (night to 96%; resets 10-31 12:00Z)')
+  await w.clock.set(Date.parse('2026-10-30T12:01:00Z'))
+  expect((await cw($, '')).text).toContain('5h 10% (resets 07:00Z), week 90% (night to 96%; resets 12:00Z)')
 })
 
 test('his prompt ends the night, and the model hears of it', async ($, on) => {

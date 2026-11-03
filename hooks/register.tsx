@@ -34,7 +34,14 @@
 // 5-hour window's reset when that is spent. The user's prompt ends it, as do its line, its
 // stop time and the week's reset. A turn that ends waiting on the user ("Needs you:") or
 // finding nothing ready pauses it until the next prompt; so does a resumed turn that makes
-// no tool call, and the eighth resume in an hour.
+// no tool call, and the eighth resume in an hour. Turns that keep ending on an API error back
+// off (10, 20, 40 minutes, then hourly), the carry-on in short once its whole text is in the
+// conversation; a turn's error that won't clear by itself (a lapsed plan, billing) pauses it
+// once a resume has failed in the run, so nothing more is sent until a turn ends well. Each
+// main-loop turn's end is counted once, before a queued clear or compaction runs, and the
+// engine may name its error after it: the night decides then.
+//
+// A time more than a day from now carries its day: `week 0% (resets 11-06 12:00Z)`.
 //
 // A suggested clear (clearAt) adds a notice when the context passes it. The
 // /context-watch command shows the settings and changes them: each one for good
@@ -45,9 +52,9 @@
 // in the status line, the notices and the log: "GPT 11%/2%", its 5 hours and its week, read in
 // the background at most every 5 minutes (codex.ts), and a log line each time it moves.
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
+import type { EngineInterface, ModelApiError, PluginOptions, Register, SessionUsage, Timer } from 'claude-code'
 
-import type { Epoch, Limit, Limits, Night, Shown } from '../types'
+import type { Epoch, Errors, Limit, Limits, Night, Shown } from '../types'
 import { due, forgetGpt, gptNow, refresh, stale, words as gptWords } from './codex'
 import type { Gpt } from './codex'
 import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, started, stillRunning } from './jobs'
@@ -169,16 +176,31 @@ let resumedBy: string | undefined
 let spoke = false
 
 const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
-// A time (ISO, or milliseconds) as HH:MMZ.
-const clock = (at?: string | number) => (at ? new Date(at).toISOString().slice(11, 16) + 'Z' : '?')
+const DAY = 86_400_000
+// A time (ISO, or milliseconds) as HH:MMZ, and with its day (MM-DD HH:MMZ) when it is more than a
+// day from `now`: a week's reset says which day it comes.
+function clock(at: string | number | null | undefined, now: number) {
+  if (!at) return '?'
+  const d = new Date(at)
+  const iso = d.toISOString()
+  return `${Math.abs(d.getTime() - now) > DAY ? `${iso.slice(5, 10)} ` : ''}${iso.slice(11, 16)}Z`
+}
 
-function windows(u: SessionUsage, lim: Limits = {}, resets = true) {
+// A reading of the meters, and when it was taken: the time its resets are written against.
+type Reading = SessionUsage & { at: number }
+
+async function reading($: Engine): Promise<Reading> {
+  const u = await $.session.usage()
+  return { ...u, at: await $.clock.now() }
+}
+
+function windows(u: Reading, lim: Limits = {}, resets = true) {
   return u.rateLimits
     .filter(r => NAMES[r.kind])
     .map(r => {
       const l = lim[r.kind]
       const ceiling = l ? [l.night ? `night to ${l.percent}%` : `limit ${l.percent}%`] : []
-      const notes = [...ceiling, ...(resets ? [`resets ${clock(r.resetsAt)}`] : [])]
+      const notes = [...ceiling, ...(resets ? [`resets ${clock(r.resetsAt, u.at)}`] : [])]
       return `${NAMES[r.kind]} ${r.percentUsed}%${notes.length ? ` (${notes.join('; ')})` : ''}`
     })
     .join(', ')
@@ -194,7 +216,7 @@ async function target($: Engine): Promise<Target> {
 }
 
 // The status line: no reset times but the 5-hour window's, in local time, then GPT's reading.
-function status(u: SessionUsage, t: Target, lim: Limits = {}) {
+function status(u: Reading, t: Target, lim: Limits = {}) {
   const line = claudeNow(u, t, lim, false)
   const at = u.rateLimits.find(r => r.kind === 'five_hour')?.resetsAt
   if (!at) return line + gptTail()
@@ -202,11 +224,11 @@ function status(u: SessionUsage, t: Target, lim: Limits = {}) {
   return `${line}; resets ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}${gptTail()}`
 }
 
-function now(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
+function now(u: Reading, t?: Target, lim: Limits = {}, resets = true) {
   return claudeNow(u, t, lim, resets) + gptTail()
 }
 
-function claudeNow(u: SessionUsage, t?: Target, lim: Limits = {}, resets = true) {
+function claudeNow(u: Reading, t?: Target, lim: Limits = {}, resets = true) {
   const c = u.context
   let ctx = c.tokens === undefined ? 'context ?' : `context ${k(c.tokens)} of ${k(c.window)}`
   if (t?.at) ctx += `, clear at ${k(t.at)}${t.own ? ' (this context)' : ''}`
@@ -230,15 +252,15 @@ async function readGpt($: Engine) {
   if (!r) return
   const { before, after } = r
   if (after?.five === before?.five && after?.week === before?.week) return
-  if (after) await log($, gptLine(after))
+  if (after) await log($, gptLine(after, await $.clock.now()))
   if (cfg.statusLine && drawn) $.ui.status(status(...drawn))
 }
 
 // The log's line for a reading: "GPT 11%/2% read (5h resets 01:37Z, week 11-09 06:37Z; plus)".
-function gptLine(g: Gpt) {
+function gptLine(g: Gpt, now: number) {
   const resets = [
-    ...(g.fiveResets ? [`5h resets ${clock(g.fiveResets)}`] : []),
-    ...(g.weekResets ? [`week ${new Date(g.weekResets).toISOString().slice(5, 16).replace('T', ' ')}Z`] : []),
+    ...(g.fiveResets ? [`5h resets ${clock(g.fiveResets, now)}`] : []),
+    ...(g.weekResets ? [`week ${clock(g.weekResets, now)}`] : []),
   ].join(', ')
   const about = [resets, g.plan ?? ''].filter(Boolean).join('; ')
   return `${gptWords(g)} read${about ? ` (${about})` : ''}`
@@ -415,13 +437,17 @@ function crossings(u: SessionUsage, t: Target): string[] {
 // The resume note, set off from what follows it; empty when none is set.
 const note = () => (cfg.resumeNote ? `${cfg.resumeNote} ` : '')
 
-// A clear or a compaction starts a new context, back on the setting's suggested clear.
+// A clear or a compaction starts a new context, back on the setting's suggested clear. A night's run
+// of errors goes on, its hold too (the API's trouble is the window's), but the new conversation holds
+// no carry-on: its next one is whole.
 async function newContext($: Engine) {
+  generation++
   bucket = undefined
   lastTokens = undefined
   told.clear()
   await update($, epoch, () => null)
   await nextContext($)
+  if ((await kept($, 'night'))?.errors?.whole) await keep($, 'night', n => n && (n.errors ? { ...n, errors: { ...n.errors, whole: false } } : n))
 }
 
 const logLine = ($: Engine) => (line: string) => log($, line)
@@ -588,7 +614,7 @@ function parse(f: Field, raw: string): { value: string | number | boolean } | st
 }
 
 async function overview($: Engine) {
-  const u = await $.session.usage()
+  const u = await reading($)
   const t = await target($)
   const lim = await limits($)
   const n = await kept($, 'night')
@@ -597,24 +623,25 @@ async function overview($: Engine) {
     ...FIELDS.slice(0, 1).map(row),
     ['epoch', t.own ? (t.at ? k(t.at) : 'off') : "the target's", "this context's own, until the next clear or compaction"],
     ...FIELDS.slice(1, 4).map(row),
-    ['limitweek', showLimit(lim.seven_day), 'stops new work once the week meter reaches it, in this window'],
-    ['limit5h', showLimit(lim.five_hour), 'stops new work once the 5-hour meter reaches it, in this window'],
-    ['night', nightLine(n), nightState(n)],
+    ['limitweek', showLimit(lim.seven_day, u.at), 'stops new work once the week meter reaches it, in this window'],
+    ['limit5h', showLimit(lim.five_hour, u.at), 'stops new work once the 5-hour meter reaches it, in this window'],
+    ['night', nightLine(n, u.at), nightState(n, u.at)],
     ...FIELDS.slice(4).map(row),
   ]
   const w = Math.min(16, Math.max(...rows.map(r => r[1].length)))
   return [now(u, t, await ceilings($)), ...rows.map(([n, v, what]) => `  ${n.padEnd(10)}${v.padEnd(w)}  ${what}`), HOW].join('\n')
 }
 
-const showLimit = (l?: Limit) => (l ? `${l.percent}%${l.until ? ` to ${l.until.slice(5, 16).replace('T', ' ')}Z` : ''}` : 'off')
+const showLimit = (l: Limit | undefined, now: number) => (l ? `${l.percent}%${l.until ? ` to ${clock(l.until, now)}` : ''}` : 'off')
 
 // /context-watch limitweek 44% (or +14%, from the meter's reading now, or off): once a reading reaches
 // it, the model is told to land and stop, in this window alone, until the meter's window resets.
 async function limit($: Engine, cmd: string, kind: string, raw: string): Promise<{ text: string; context?: string[] }> {
   const all = await limits($)
-  const r = (await $.session.usage()).rateLimits.find(x => x.kind === kind)
+  const u = await reading($)
+  const r = u.rateLimits.find(x => x.kind === kind)
   const name = NAMES[kind] ?? kind
-  if (!raw) return { text: `${cmd}: ${showLimit(all[kind])}${r ? `; the ${name} meter reads ${r.percentUsed}%` : ''}.` }
+  if (!raw) return { text: `${cmd}: ${showLimit(all[kind], u.at)}${r ? `; the ${name} meter reads ${r.percentUsed}%` : ''}.` }
   told.delete(kind)
   if (['off', 'none'].includes(raw.toLowerCase())) {
     delete all[kind]
@@ -631,11 +658,11 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
   if (r) seen[kind] = r.percentUsed
   const past = r !== undefined && r.percentUsed >= percent
   if (past) told.add(kind)
-  await log($, `/context-watch ${cmd} ${raw}: ${showLimit(all[kind])}, the meter at ${r?.percentUsed ?? '?'}%`)
+  await log($, `/context-watch ${cmd} ${raw}: ${showLimit(all[kind], u.at)}, the meter at ${r?.percentUsed ?? '?'}%`)
   return {
     text: past
       ? `${cmd}: ${percent}%, reached already (${r.percentUsed}%): the model is told to land what is in flight and start nothing new.`
-      : `${cmd}: ${showLimit(all[kind])}, the meter at ${r?.percentUsed ?? '?'}%: once a reading reaches it, the model is told to land and stop, in this window alone.`,
+      : `${cmd}: ${showLimit(all[kind], u.at)}, the meter at ${r?.percentUsed ?? '?'}%: once a reading reaches it, the model is told to land and stop, in this window alone.`,
     context: past
       ? [stopWords(name, cmd, `${r.percentUsed}% is past the limit the user just set, ${percent}%`)]
       : [`[context-watch] The user set a ${name} usage limit of ${percent}% for this window, until the meter's window resets.`],
@@ -647,9 +674,32 @@ async function limit($: Engine, cmd: string, kind: string, raw: string): Promise
 const MIN = 60_000
 const RESUME_AFTER = 2 * MIN // a turn that ended under the line
 const RETRY_AFTER = 10 * MIN // after an error, or a spent 5-hour window with no reset time
+const RETRY_MAX = 60 * MIN // the longest wait after errors
 const PAST_RESET = 2 * MIN // a spent 5-hour window: this long after its reset
 const RESUMES_AN_HOUR = 8 // this many in the last hour pause the night: a loop
 const CARRY_ON = 'Carrying on the night'
+// The wait after the `turns`-th turn in a row that ended on an error: 10, 20, 40 minutes, then hourly.
+const retryAfter = (turns: number) => Math.min(RETRY_MAX, RETRY_AFTER * 2 ** Math.max(0, turns - 1))
+// Each of the engine's errors (StopFailure's words): one that may clear by itself, so the night backs
+// off, or one that waits on the user (a lapsed plan, a sign-in, billing, a request refused), so the
+// night pauses once a resume has failed in the run. As ModelApiError's doc has them where it says;
+// every kind is placed, so one the engine adds fails tsc here until it is. A word not in it clears.
+const KINDS: Record<ModelApiError, 'clears' | 'waits'> = {
+  rate_limit: 'clears',
+  overloaded: 'clears',
+  server_error: 'clears',
+  max_output_tokens: 'clears',
+  unknown: 'clears',
+  authentication_failed: 'waits',
+  oauth_org_not_allowed: 'waits',
+  account_on_hold: 'waits',
+  verification_required: 'waits',
+  billing_error: 'waits',
+  invalid_request: 'waits',
+  model_not_found: 'waits',
+  cloud_credential_error: 'waits',
+}
+const waits = (kind: string | null) => kind !== null && (KINDS as Record<string, string | undefined>)[kind] === 'waits'
 // A turn's answer that waits on the user or finds nothing ready: a line that starts with either.
 const WAITS = /^[\s>*_#-]*(needs you|nothing ready)\b/im
 const NIGHT_HOW =
@@ -668,6 +718,14 @@ let turnRunning = false
 // resume, logged once.
 let endedNote: string | undefined
 let heldByAgents = false
+// The kind of API error the last main-loop turn ended on, once the engine has said it (StopFailure,
+// before the turn's end or after it), and whether that end is counted in the night's run of errors:
+// a StopFailure after it is late, and the night decides then.
+let failure: string | null = null
+let counted = false
+// Moves with each thing that may change what the night does next: a prompt, a main-loop turn's
+// start, an error named, a new context. A resume that came due sends nothing once it has moved.
+let generation = 0
 
 const hourAgo = (t: number) => (r: string) => Date.parse(r) > t - 60 * MIN
 
@@ -675,7 +733,7 @@ const hourAgo = (t: number) => (r: string) => Date.parse(r) > t - 60 * MIN
 // meter at its line (or at a lower week limit). No week reading: not over.
 function over(n: Night, u: SessionUsage, lim: Limits, t: number): string | undefined {
   if (n.weekResets && Date.parse(n.weekResets) <= t) return "the week's window reset"
-  if (n.until && Date.parse(n.until) <= t) return `its stop time, ${clock(n.until)}`
+  if (n.until && Date.parse(n.until) <= t) return `its stop time, ${clock(n.until, t)}`
   const week = u.rateLimits.find(r => r.kind === 'seven_day')
   const line = lim.seven_day?.percent ?? n.line
   if (week && week.percentUsed >= line) return `the week meter at ${week.percentUsed}%, its line ${line}%`
@@ -684,22 +742,63 @@ function over(n: Night, u: SessionUsage, lim: Limits, t: number): string | undef
 
 // The prompt that resumes the session: where the meters stand, the user's words, what to do, and
 // how to stop.
-function carryOn(n: Night, u: SessionUsage, lim: Limits) {
+function carryOn(n: Night, u: Reading, lim: Limits) {
   const at = (kind: string) => u.rateLimits.find(r => r.kind === kind)?.percentUsed
   const five = at('five_hour')
   return (
     `${CARRY_ON} (context-watch): the week meter at ${at('seven_day') ?? '?'}% of its line, ${lim.seven_day?.percent ?? n.line}%` +
-    `${five === undefined ? '' : `, the 5-hour window at ${five}%`}${n.until ? `, until ${clock(n.until)}` : ''}. ` +
+    `${five === undefined ? '' : `, the 5-hour window at ${five}%`}${n.until ? `, until ${clock(n.until, u.at)}` : ''}. ` +
     `Set from the user's words: ${n.words} ${note()}${n.next}\n\n` +
     'When nothing is ready, or what is left waits on the user, end the turn with a line that starts `Needs you:` or ' +
     '`Nothing ready:`; the night then pauses until the next prompt.'
   )
 }
 
+// The carry-on once the whole one is in this conversation and a carry-on's turn ended on an error: the
+// run and the meter, never the user's words again (11-03: 19 whole copies reached the model at once
+// when the lapsed plan came back).
+function shortCarryOn(n: Night, e: Errors, u: Reading, lim: Limits) {
+  const week = u.rateLimits.find(r => r.kind === 'seven_day')?.percentUsed
+  return (
+    `${CARRY_ON} (context-watch): ${erred(e, u.at)}. The week meter at ${week ?? '?'}% of its line, ` +
+    `${lim.seven_day?.percent ?? n.line}%; the night's carry-on above still says what to do, and how to pause it.`
+  )
+}
+
+// A run of errors in words: "the turn ended on an error (overloaded)", "3 turns in a row ended on an
+// error (overloaded), the first at 03:49Z".
+function erred(e: Errors, now: number) {
+  const kind = e.kind ? ` (${e.kind})` : ''
+  return e.turns > 1 ? `${e.turns} turns in a row ended on an error${kind}, the first at ${clock(e.since, now)}` : `the turn ended on an error${kind}`
+}
+
+// The run with one more turn that ended on an error (`resumed`: a carry-on's), of `kind`: this turn's
+// own, as the engine has said it by now, never an earlier turn's (null until it is said).
+function more(was: Errors | null | undefined, t: number, resumed: boolean, kind: string | null): Errors {
+  return {
+    since: was?.since ?? new Date(t).toISOString(),
+    turns: (was?.turns ?? 0) + 1,
+    held: (was?.held ?? false) || resumed,
+    whole: (was?.whole ?? false) || resumed,
+    kind,
+  }
+}
+
+// Why a run of errors pauses the night, or undefined: its last turn ended on an error that won't
+// clear by itself, and a resume has failed in the run, so nothing more is sent until a turn ends
+// well. A prompt from elsewhere lifts the pause, and its turn's end decides again.
+function stuck(e: Errors | null | undefined) {
+  if (!e?.held || !waits(e.kind)) return undefined
+  return `a resume failed, and the turn ended on an error that won't clear by itself (${e.kind})`
+}
+
+// A queued compaction or clear runs, or is about to: its own prompt follows, not a carry-on.
+const clearing = () => running || pending !== undefined || pendingClear !== undefined
+
 // What the model reads beside the user's prompt after the night ended: what it was, and how to
 // set it again.
-const endedWords = (n: Night, how: string) =>
-  `[context-watch] ${how} (to ${n.line}% of the week${n.until ? `, until ${clock(n.until)}` : ''}), set from: ` +
+const endedWords = (n: Night, how: string, now: number) =>
+  `[context-watch] ${how} (to ${n.line}% of the week${n.until ? `, until ${clock(n.until, now)}` : ''}), set from: ` +
   `${n.words}. If the words of the prompt carry the night on, set it again with mcp__context-watch__${NIGHT}.`
 
 function disarm() {
@@ -743,69 +842,125 @@ async function agentsAtWork($: Engine) {
 }
 
 // The armed resume comes due: the carry-on, unless the night is over or paused, or the session is
-// busy (that turn's end arms the next). While an agent is at work, it looks again in 2 minutes.
+// busy (that turn's end arms the next). While an agent is at work, it looks again in 2 minutes. The
+// carry-on is short once a run of errors holds the whole one in this conversation. What arrives while
+// it reads the meters and the agents moves the generation, and the night is read last: nothing comes
+// between the last look and the submit, and the resume is written down after it.
 async function wakeUp($: Engine) {
   wake = undefined
-  const n = await kept($, 'night')
-  if (!n || n.paused || running || pending || pendingClear || turnRunning) return
-  const t = await $.clock.now()
-  const u = await $.session.usage()
+  const gen = generation
+  const idle = () => gen === generation && !clearing() && !turnRunning && !sentResume
+  if (!idle()) return
+  const u = await reading($)
+  const t = u.at
   const lim = await ceilings($)
+  const atWork = await agentsAtWork($)
+  const n = await kept($, 'night')
+  if (!n || n.paused || !idle()) return
   const done = over(n, u, lim, t)
   if (done) return endNight($, done)
-  if (await agentsAtWork($)) {
+  if (atWork) {
     if (!heldByAgents) await log($, 'the night holds its resume while an agent is at work, and looks again every 2 minutes')
     heldByAgents = true
     return arm($, t + RESUME_AFTER)
   }
   heldByAgents = false
+  // A hold is decided at the turn's end, or as its error is named after it: no resume goes past one.
+  const holds = stuck(n.errors)
+  if (holds) return pause($, holds)
+  const short = n.errors?.whole ? n.errors : undefined
+  sentResume = true
+  const taking = $.prompt.submit({ text: short ? shortCarryOn(n, short, u, lim) : carryOn(n, u, lim) }).then(
+    () => '',
+    (err: unknown) => String(err).slice(0, 120) || 'refused',
+  )
   const resumes = [...n.resumes.filter(hourAgo(t)), new Date(t).toISOString()]
   await keep($, 'night', cur => cur && { ...cur, resumes, wakeAt: null })
-  sentResume = true
-  await log($, `the night resumed the session (${resumes.length} in the last hour) | ${now(u, undefined, lim)}`)
-  try {
-    await $.prompt.submit({ text: carryOn(n, u, lim) })
-  } catch (err) {
-    sentResume = false
-    await log($, `the night's carry-on was not taken (${String(err).slice(0, 120)}); trying again in 10 minutes`)
-    await arm($, t + RETRY_AFTER)
-  }
+  await log($, `the night resumed the session (${resumes.length} in the last hour${short ? ', the short carry-on' : ''}) | ${now(u, undefined, lim)}`)
+  const refused = await taking
+  if (!refused) return
+  sentResume = false
+  await log($, `the night's carry-on was not taken (${refused}); trying again in 10 minutes`)
+  await arm($, t + RETRY_AFTER)
 }
 
-// A main-loop turn ended with a night on (`resumed`: a carry-on's turn; `made`: its tool calls).
-// The night ends, pauses, or arms its next resume, in this order.
-async function afterTurn($: Engine, e: { reason: string; answer: string }, resumed: boolean, made: number) {
+// A main-loop turn's end, counted once whatever comes next (a queued compaction or clear, or the
+// night's next resume, which reads it; `resumed`: a carry-on's turn). An Esc ends the night. An error
+// adds a turn to the run of them, of the kind the engine has named by now: a StopFailure from then on
+// is late (named, below). Any other end ends the run.
+async function account($: Engine, e: { reason: string }, resumed: boolean) {
   const n = await kept($, 'night')
-  if (!n || running) return
+  if (!n) return
+  const t = await $.clock.now()
   if (e.reason === 'aborted') {
-    endedNote = endedWords(n, 'The user interrupted a turn, which ended the night')
+    endedNote = endedWords(n, 'The user interrupted a turn, which ended the night', t)
     return endNight($, 'the user interrupted the turn')
   }
-  if (n.paused) return
+  const failed = e.reason === 'error'
+  if (!failed && !n.errors) {
+    counted = true
+    return
+  }
+  await keep($, 'night', cur => {
+    if (!cur) return cur
+    counted = true // with `failure` read in the same step
+    return { ...cur, errors: failed ? more(cur.errors, t, resumed, failure) : null }
+  })
+}
+
+// The engine named the last turn's error after its end was counted: the run's last turn takes the
+// kind, and the night decides then, as it would have at the turn's end. One that won't clear pauses
+// it, a resume having failed in the run; one that may leaves the armed resume, armed again if one
+// that came due meanwhile gave way to this news. While a queued clear or compaction runs, its own
+// prompt's turn decides.
+async function named($: Engine, kind: string) {
+  const n = await kept($, 'night')
+  if (!n?.errors) return
+  await keep($, 'night', cur => (cur?.errors ? { ...cur, errors: { ...cur.errors, kind } } : cur))
+  const holds = n.paused || clearing() ? undefined : stuck({ ...n.errors, kind })
+  if (holds) return pause($, holds)
+  const at = n.paused ? null : n.wakeAt
   const t = await $.clock.now()
+  await log($, `the turn's error, named after its end: ${kind}${at ? `; the resume at ${clock(at, t)} stands` : ''}`)
+  if (at && !wake) await schedule($, Date.parse(at))
+}
+
+// A main-loop turn ended with a night on, its end counted (`resumed`: a carry-on's turn; `made`: its
+// tool calls). The night ends, pauses, or arms its next resume, in this order.
+async function afterTurn($: Engine, e: { reason: string; answer: string }, resumed: boolean, made: number) {
+  const n = await kept($, 'night')
+  if (!n || n.paused || running) return
+  const t = await $.clock.now()
+  const errors = e.reason === 'error' ? (n.errors ?? null) : null
   const u = await $.session.usage()
   const lim = await ceilings($)
   const done = over(n, u, lim, t)
   if (done) return endNight($, done)
   if (e.reason === 'refusal') return pause($, 'the turn ended in a refusal')
-  const waits = e.answer.match(WAITS)
-  if (waits) return pause($, `the turn ended with "${waits[1]}"`)
+  const waiting = e.answer.match(WAITS)
+  if (waiting) return pause($, `the turn ended with "${waiting[1]}"`)
   if (resumed && !made && e.reason === 'answer') return pause($, 'the resumed turn made no tool call')
   const lastHour = n.resumes.filter(hourAgo(t)).length
   if (lastHour >= RESUMES_AN_HOUR) return pause($, `${lastHour} resumes in the last hour`)
-  // An error near the 5-hour limit is most likely the limit itself.
+  const holds = stuck(errors)
+  if (holds) return pause($, holds)
+  // An error near the 5-hour limit is most likely the limit itself: the resume waits for its reset,
+  // never sooner than the run's own wait.
   const five = u.rateLimits.find(r => r.kind === 'five_hour')
-  let at = t + (e.reason === 'error' ? RETRY_AFTER : RESUME_AFTER)
-  let why = e.reason === 'error' ? 'the turn ended on an error' : 'the turn ended under the line'
-  if (five && (five.percentUsed >= Math.min(100, lim.five_hour?.percent ?? 100) || (e.reason === 'error' && five.percentUsed >= 90))) {
-    at = five.resetsAt ? Date.parse(five.resetsAt) + PAST_RESET : t + RETRY_AFTER
-    why = `the 5-hour window is spent (${five.percentUsed}%)`
+  let at = t + (errors ? retryAfter(errors.turns) : RESUME_AFTER)
+  let why = errors ? erred(errors, t) : 'the turn ended under the line'
+  if (five && (five.percentUsed >= Math.min(100, lim.five_hour?.percent ?? 100) || (errors && five.percentUsed >= 90))) {
+    const reset = five.resetsAt ? Date.parse(five.resetsAt) + PAST_RESET : t + RETRY_AFTER
+    if (reset > at) {
+      at = reset
+      why = `the 5-hour window is spent (${five.percentUsed}%)`
+    }
   }
-  if (n.until && at >= Date.parse(n.until)) return endNight($, `its next resume would come after its stop time, ${clock(n.until)}`)
+  if (n.until && at >= Date.parse(n.until)) return endNight($, `its next resume would come after its stop time, ${clock(n.until, t)}`)
   if (n.weekResets && at >= Date.parse(n.weekResets))
-    return endNight($, `its next resume would come after the week's window resets, ${clock(n.weekResets)}`)
+    return endNight($, `its next resume would come after the week's window resets, ${clock(n.weekResets, t)}`)
   await arm($, at)
-  await log($, `the night waits: ${why}; resuming at ${clock(at)}`)
+  await log($, `the night waits: ${why}; resuming at ${clock(at, t)}${errors?.whole ? ' with the short carry-on' : ''}`)
 }
 
 // A stop time, in milliseconds: 09:30 (local, the next one), +8h or +90m from `t`, or an ISO time
@@ -847,7 +1002,7 @@ async function setNight($: Engine, o: { line: number; until?: string; words: str
   if (o.until) {
     const at = stopTime(o.until, t)
     if (at === undefined) return { refused: `"${o.until}" is no stop time: 09:30 (local), +8h, +90m, or an ISO time.` }
-    if (at <= t) return { refused: `its stop time, ${clock(at)}, has passed.` }
+    if (at <= t) return { refused: `its stop time, ${clock(at, t)}, has passed.` }
     until = new Date(at).toISOString()
   }
   disarm()
@@ -862,10 +1017,11 @@ async function setNight($: Engine, o: { line: number; until?: string; words: str
     resumes: (before?.resumes ?? []).filter(hourAgo(t)),
     paused: null,
     wakeAt: null,
+    errors: null,
   }))
   told.delete('seven_day')
   seen.seven_day = week.percentUsed
-  const to = `to ${line}% of the week (the meter at ${week.percentUsed}%)${until ? `, until ${clock(until)}` : ''}`
+  const to = `to ${line}% of the week (the meter at ${week.percentUsed}%)${until ? `, until ${clock(until, t)}` : ''}`
   await log($, `the night set: ${to} | from: ${o.words.slice(0, 200)}`)
   return {
     text:
@@ -875,14 +1031,14 @@ async function setNight($: Engine, o: { line: number; until?: string; words: str
   }
 }
 
-const nightLine = (n: Night | null) => (n ? `${n.line}%${n.until ? ` to ${clock(n.until)}` : ''}` : 'off')
-const nightState = (n: Night | null) =>
+const nightLine = (n: Night | null, now: number) => (n ? `${n.line}%${n.until ? ` to ${clock(n.until, now)}` : ''}` : 'off')
+const nightState = (n: Night | null, now: number) =>
   !n
     ? 'runs the session on to a line on the week meter'
     : n.paused
       ? `paused: ${n.paused}, until the next prompt`
       : n.wakeAt
-        ? `resumes at ${clock(n.wakeAt)}`
+        ? `resumes at ${clock(n.wakeAt, now)}`
         : 'resumes a turn that ends under it'
 
 // /context-watch night: the night whole; `night 96% [until 09:30 | for 8h]`, `night +3%` or
@@ -898,11 +1054,12 @@ async function nightCommand($: Engine, raw: string): Promise<{ text: string; con
     const line = (await ceilings($)).seven_day?.percent ?? n.line
     return {
       text: [
-        `night: ${nightLine(n)}, the week meter at ${week?.percentUsed ?? '?'}%` +
-          `${line < n.line ? ` (this window's week limit, ${line}%, holds below it)` : ''}; ${nightState(n)}.`,
+        `night: ${nightLine(n, t)}, the week meter at ${week?.percentUsed ?? '?'}%` +
+          `${line < n.line ? ` (this window's week limit, ${line}%, holds below it)` : ''}; ${nightState(n, t)}.`,
         `  set from: ${n.words}`,
         `  each resume: ${n.next}`,
         `  resumes in the last hour: ${n.resumes.filter(hourAgo(t)).length} of at most ${RESUMES_AN_HOUR}`,
+        ...(n.errors ? [`  errors: ${erred(n.errors, t)}`] : []),
       ].join('\n'),
     }
   }
@@ -918,7 +1075,7 @@ async function nightCommand($: Engine, raw: string): Promise<{ text: string; con
   const set = await setNight($, {
     line: (m[1] ? (week?.percentUsed ?? 0) : 0) + Number(m[2]),
     until: m[3] ?? (m[4] ? `+${m[4].replace(/^\+/, '')}` : undefined),
-    words: `/context-watch night ${raw}, typed at ${clock(t)}`,
+    words: `/context-watch night ${raw}, typed at ${clock(t, t)}`,
     next: 'Carry on with the next piece of work.',
   })
   if ('refused' in set) return { text: `night: ${set.refused}` }
@@ -949,7 +1106,7 @@ async function command($: Engine, args: string): Promise<{ text: string; context
       await update($, epoch, (): Epoch => ({ clearAt: n, session }))
       text = `This context's suggested clear: ${n ? k(n) : 'off'}, until the next clear or compaction (the target stays ${cfg.clearAt ? k(cfg.clearAt) : 'off'}).`
     }
-    const u = await $.session.usage()
+    const u = await reading($)
     const t = await target($)
     lastTokens = u.context.tokens
     if (cfg.statusLine) $.ui.status(status(u, t))
@@ -1100,7 +1257,7 @@ export const register: Register = (on, options) => {
     if (held) return { deny: held }
     pendingClear = { brief: input.brief }
     spoke = false
-    const u = await $.session.usage()
+    const u = await reading($)
     await log($, `clear asked for at ${now(u)} | brief: ${input.brief.slice(0, 200)}`)
     return { result: 'Queued: the conversation clears when this turn ends, then the brief starts the next one. End the turn now.' }
   })
@@ -1112,7 +1269,7 @@ export const register: Register = (on, options) => {
     const held = cfg.door ? await clearDoor($, input.carry, 'compaction', await sinceCalls($), logLine($)) : undefined
     if (held) return { deny: held }
     pending = { keep: input.keep, next: input.next }
-    const u = await $.session.usage()
+    const u = await reading($)
     await log($, `compaction asked for at ${now(u)} | keep: ${input.keep.slice(0, 200)}`)
     return { result: 'Queued: the conversation compacts when this turn ends, then a prompt resumes with `next`. End the turn now.' }
   })
@@ -1166,12 +1323,12 @@ export const register: Register = (on, options) => {
     // A codex command may have spent GPT's usage: read it again now.
     if (e.tool === 'Bash' && /\bcodex\b/.test(args.command ?? '')) stale()
 
-    const u = await $.session.usage()
+    const u = await reading($)
     const t = await target($)
     const lim = await ceilings($)
     drawn = [u, t, lim]
     if (cfg.statusLine) $.ui.status(status(u, t, lim))
-    if (cfg.gpt && due(await $.clock.now())) void readGpt($).catch(() => undefined)
+    if (cfg.gpt && due(u.at)) void readGpt($).catch(() => undefined)
     const crossed = crossings(u, t)
     const reached = limitWords(u, lim)
     if (reached.length) await log($, `${reached.join(' ').slice(0, 300)} | ${now(u, t, lim)}`)
@@ -1202,8 +1359,10 @@ export const register: Register = (on, options) => {
   // Any prompt but the mod's own: typed or queued (the event fires at the user's Enter, mid-turn
   // too), from the terminal, the phone or Slack, or a notice, a peer's message, another mod's.
   // The user's own ends a night (but /context-watch, which sets it), and the model reads why beside
-  // it; a slash command keeps those words for the next prompt. Any other lifts a night's pause.
+  // it; a slash command keeps those words for the next prompt. Any other lifts a night's pause. Each
+  // but /context-watch, which starts no turn, is news to a resume that came due (generation).
   on('prompt.submit', async ($, e, next) => {
+    if (e.command?.name !== 'context-watch') generation++
     if (doorNote && !e.command) {
       doorNote = false
       const words = await still($, 'clear')
@@ -1223,7 +1382,7 @@ export const register: Register = (on, options) => {
     }
     if (n) {
       await endNight($, "the user's prompt")
-      endedNote = endedWords(n, "The user's prompt ended the night")
+      endedNote = endedWords(n, "The user's prompt ended the night", await $.clock.now())
     }
     if (!endedNote || e.command) return next(e)
     const words = endedNote
@@ -1234,15 +1393,31 @@ export const register: Register = (on, options) => {
   // A main-loop turn begins: whether it is a carry-on's, and the armed resume is dropped (the turn's
   // own end arms the next).
   on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) generation++
     const started = await next(e)
     if (e.agentId !== undefined) return started
     nightTurn = sentResume && (!e.text || e.text.includes(CARRY_ON))
     sentResume = false
+    failure = null
+    counted = false
     calls = 0
     turnRunning = true
     disarm()
     if ((await kept($, 'night'))?.wakeAt) await keep($, 'night', n => n && { ...n, wakeAt: null })
     return started
+  })
+
+  // The kind of API error a main-loop turn ended on, in the engine's word (overloaded, billing_error
+  // ...), to tell one that clears by itself from one that waits on the user. Said before the turn's
+  // end, the turn's count takes it; said after (late), the night decides then.
+  on('classic.StopFailure', async ($, e, next) => {
+    if (e.agent_id !== undefined) return next(e)
+    generation++
+    failure = e.error
+    const late = counted
+    const done = await next(e)
+    if (late) await named($, e.error)
+    return done
   })
 
   on('session.compact', async ($, e, next) => {
@@ -1282,8 +1457,8 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // A main-loop turn ends (an agent's end is not the session's): its words are kept, then a queued
-  // compaction or clear runs, else a night decides what comes next.
+  // A main-loop turn ends (an agent's end is not the session's): its words are kept and its end is
+  // counted, then a queued compaction or clear runs, else a night decides what comes next.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     if (e.agentId !== undefined) return done
@@ -1293,6 +1468,11 @@ export const register: Register = (on, options) => {
       if (words) await remember($, words)
     } catch (err) {
       await log($, `the turn's words were not kept: ${String(err).slice(0, 200)}`)
+    }
+    try {
+      await account($, e, nightTurn)
+    } catch (err) {
+      await log($, `the night missed a turn's end: ${String(err).slice(0, 200)}`)
     }
     if (pending) {
       const p = pending

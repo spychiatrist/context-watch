@@ -23,7 +23,16 @@ export type Night = {
   resumes: string[] // when it resumed the session, within the last hour
   paused: string | null // why it waits for the next prompt; null, it runs
   wakeAt: string | null // the resume armed
+  errors?: Errors | null // the main loop's turns in a row that ended on an error; absent before 0.8.1
 }
+
+// The main loop's turns in a row that ended on an API error while a night ran: when the first ended
+// (ISO), and how many. `held`: a carry-on's turn is among them, so a resume has failed in the run (the
+// window's, kept until a turn ends well). `whole`: a carry-on's turn among them failed in this
+// conversation, so the whole carry-on is in it (a new context starts it over). `kind`: the last
+// turn's own error as the engine words it (StopFailure's: overloaded, billing_error,
+// oauth_org_not_allowed ...), null until it is said.
+export type Errors = { since: string; turns: number; held: boolean; whole: boolean; kind: string | null }
 
 // A background job of the session's: a Bash command run in the background (or sent there), a
 // Monitor, or a Bash shell found running from before the context that no log saw start. Its shell

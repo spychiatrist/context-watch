@@ -45,7 +45,7 @@ When one is crossed, a short notice is added to that tool result, which only the
 
 ```
 [context-watch] context passed 200k: context 201k of 1000k; 5h 34% (resets 16:00Z),
-week 41% (resets 00:00Z); autocompact at 950k. Landing work at a seam keeps a
+week 41% (resets 11-06 12:00Z); autocompact at 950k. Landing work at a seam keeps a
 compaction cheap; mcp__context-watch__compact_and_continue compacts and resumes
 when that helps, and mcp__context-watch__clear_and_restart starts fresh from a
 brief once the state is in files and no agents run.
@@ -53,6 +53,7 @@ brief once the state is in files and no agents run.
 
 Notes:
 
+- A time more than a day away carries its day (`resets 11-06 12:00Z`); a nearer one is its time alone (`resets 16:00Z`). All times are UTC.
 - Each mark fires once on the way up. After a compaction the context marks start over; after a usage window resets, its marks start over.
 - The first reading after the mod loads (or reloads) is taken silently, so a reload never repeats a notice.
 - Subagents' tool calls are ignored.
@@ -131,19 +132,23 @@ While it's on, each turn of the main session that ends under the line is resumed
 
 - **Two minutes later**, as a rule.
 - **At the 5-hour window's reset** (plus two minutes) when that window is spent, or past `limit5h`, or an error came with it at 90% or more.
-- **Ten minutes later** after an error, or when the 5-hour reset time is unknown.
+- **After an error, ten minutes later**, doubling with each turn in a row that ends on one: 10, 20, 40 minutes, then every hour.
+- **Ten minutes later** when the 5-hour window is spent and its reset time is unknown.
 - **Held while an agent is at work**: its report starts a turn of its own. The night looks again every two minutes.
 
-The carry-on names the meters, the line, your words and `next` (with `resumeNote` before it).
+The carry-on names the meters, the line, your words and `next` (with `resumeNote` before it). A run of errors gets it whole once. After a carry-on's own turn fails, the next ones are short: how many turns failed since when, and the meter. A failed turn's prompt stays in the conversation, so whole copies would pile up (on 11-03 a lapsed plan stacked 19 of them). Every turn of the main session counts, one that queued a clear or a compaction too. A turn that ends well ends the run. A clear or compaction doesn't end it, but the new conversation gets the whole carry-on once.
 
-It ends at the line, at its stop time, at the week window's reset, or when its next resume would fall after one of those. Your own prompt ends it too: typed, from the phone, or a Slack ping. The model reads why beside your prompt, and how to set it again if your words carry the night on. An Esc that interrupts a turn ends it as well; the model hears that with your next prompt.
+A resume that comes due reads the meters and the night before it sends anything. What arrives meanwhile (a prompt, a turn's start, an error named) stops it, and that turn's end decides the next.
+
+It ends at the line, at its stop time, at the week window's reset, or when its next resume would fall after one of those. Your own prompt ends it too: typed, from the phone, or a Slack ping. The model reads why beside your prompt, and how to set it again if your words carry the night on. An Esc that interrupts a turn ends it as well, one that queued a clear too; the model hears that with your next prompt.
 
 It pauses until the next prompt of any kind (a task's report lifts the pause) when:
 
 - a turn ends with a line that starts `Needs you:` or `Nothing ready:` (the carry-on asks the model to write one when it's out of work);
 - a resumed turn makes no tool call;
 - there were eight resumes in the last hour (a loop);
-- the model refused.
+- the model refused;
+- a turn ended on an error that won't clear by itself, once a resume has failed in the run of errors. The kind is the engine's word for that turn's own error (a lapsed plan, a sign-in, billing, a request refused). Then nothing more is sent until a turn ends well: a report's turn that fails the same way pauses it again. An error that may clear (overloaded, a rate limit, a server error, a cut-off answer, or one the engine didn't name) backs off instead. The engine may name a turn's error only after the turn's end; the night decides then.
 
 Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the window through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
 
@@ -209,7 +214,8 @@ Set `keepTurns: 0` to turn this off.
 | `tool.call` (every call) | Holds the door after a new context until each job from before is carried on or stopped; logs a background job as it starts; answers the `jobs` tool; reads usage (GPT's in the background, at most every 5 minutes), updates the status line, checks the marks and the ceilings (limits, a night's line), adds the notice with the Mac's load, logs. |
 | `tool.call` (its own three tools) | Checks the input; queues the compaction or clear, or sets the night. |
 | `turn.start` | Notes whether the turn is a night's carry-on; drops a waiting resume (the turn's end arms the next). |
-| `turn.complete` | Saves the turn's words; starts a queued compaction or clear a second later, or else lets a night end, pause or arm its next resume. Subagents' turns are ignored. |
+| `classic.StopFailure` | Notes the kind of API error a main-loop turn ended on (overloaded, billing_error, ...), so a night can tell one that clears by itself from one that waits on you. Said after the turn's end, the night decides then. |
+| `turn.complete` | Saves the turn's words and counts its end in a night's run of errors; starts a queued compaction or clear a second later, or else lets a night end, pause or arm its next resume. Subagents' turns are ignored. |
 | `prompt.submit` | Notes that a prompt came, so a compaction doesn't send a second resume prompt. One of yours drops a queued clear and ends a night; any other lifts a night's pause. |
 | `session.compact` | Logs the tokens before and after; resets the context marks and the context's own suggested clear. |
 | `command.run` (`/clear`) | Holds the last turn's words for the clear's row; resets the context marks and the context's own suggested clear. |
