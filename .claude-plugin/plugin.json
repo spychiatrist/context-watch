@@ -1,6 +1,6 @@
 {
   "name": "context-watch",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "Tells the model its context size and plan usage at each 100k and usage mark, suggests a clear, logs it, lets it compact or clear itself and carry on, shows GPT's usage beside Claude's where the Codex CLI is signed in, runs a night on to a line on the week meter, and holds a door at each new context for the background jobs still running; /context-watch shows and changes the settings",
   "author": {
     "name": "spychiatrist",

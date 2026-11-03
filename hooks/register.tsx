@@ -57,7 +57,7 @@ import type { EngineInterface, ModelApiError, PluginOptions, Register, SessionUs
 import type { Epoch, Errors, Limit, Limits, Night, Shown } from '../types'
 import { due, forgetGpt, gptNow, refresh, stale, words as gptWords } from './codex'
 import type { Gpt } from './codex'
-import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, started, stillRunning } from './jobs'
+import { JOBS_TOOL, clearDoor, door, forgetDoor, jobsTool, macNow, nextContext, oneLine, started, stillRunning } from './jobs'
 import { forget } from './procs'
 import { folder, forgetWindow, keep, kept, pruneWindows } from './window'
 
@@ -845,7 +845,10 @@ async function agentsAtWork($: Engine) {
 // busy (that turn's end arms the next). While an agent is at work, it looks again in 2 minutes. The
 // carry-on is short once a run of errors holds the whole one in this conversation. What arrives while
 // it reads the meters and the agents moves the generation, and the night is read last: nothing comes
-// between the last look and the submit, and the resume is written down after it.
+// between the last look and the submit. The resume is written down once the carry-on is taken. One
+// dropped, by a hook (a settings hook's block, another mod's refusal) or the engine (a host's limit),
+// pauses the night with the reason, since the next would be dropped too; a submit that fails outright
+// is tried again in 10 minutes.
 async function wakeUp($: Engine) {
   wake = undefined
   const gen = generation
@@ -870,18 +873,19 @@ async function wakeUp($: Engine) {
   if (holds) return pause($, holds)
   const short = n.errors?.whole ? n.errors : undefined
   sentResume = true
-  const taking = $.prompt.submit({ text: short ? shortCarryOn(n, short, u, lim) : carryOn(n, u, lim) }).then(
-    () => '',
-    (err: unknown) => String(err).slice(0, 120) || 'refused',
+  const missed = await $.prompt.submit({ text: short ? shortCarryOn(n, short, u, lim) : carryOn(n, u, lim) }).then(
+    r => (r.drop === undefined ? undefined : { dropped: oneLine(r.drop) }),
+    (err: unknown) => ({ refused: String(err).slice(0, 120) || 'refused' }),
   )
+  if (missed) {
+    sentResume = false
+    if ('dropped' in missed) return pause($, `the carry-on was dropped (${missed.dropped})`)
+    await log($, `the night's carry-on was not taken (${missed.refused}); trying again in 10 minutes`)
+    return arm($, t + RETRY_AFTER)
+  }
   const resumes = [...n.resumes.filter(hourAgo(t)), new Date(t).toISOString()]
   await keep($, 'night', cur => cur && { ...cur, resumes, wakeAt: null })
   await log($, `the night resumed the session (${resumes.length} in the last hour${short ? ', the short carry-on' : ''}) | ${now(u, undefined, lim)}`)
-  const refused = await taking
-  if (!refused) return
-  sentResume = false
-  await log($, `the night's carry-on was not taken (${refused}); trying again in 10 minutes`)
-  await arm($, t + RETRY_AFTER)
 }
 
 // A main-loop turn's end, counted once whatever comes next (a queued compaction or clear, or the

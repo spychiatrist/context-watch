@@ -64,7 +64,8 @@ function members(j: Job, procs: readonly Proc[]) {
   return procs.filter(p => p.pgid === j.pid && (j.start === null || p.start >= j.start - 2000))
 }
 
-function oneLine(s: string) {
+// A text in one line, newlines shown as ⏎, cut at 140 characters.
+export function oneLine(s: string) {
   const t = s.trim().replace(/\s*\n\s*/g, ' ⏎ ')
   return t.length > 140 ? `${t.slice(0, 139)}…` : t
 }

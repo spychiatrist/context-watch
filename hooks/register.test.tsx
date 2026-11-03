@@ -503,8 +503,9 @@ test('the answer pasted is the one on screen when the clear runs', async ($, on)
 })
 
 // The night (/context-watch night, the night tool): the session runs on to a line on the week
-// meter. The world: a clock at 03:00Z, the meters as the test sets them, the agents at work, the
-// prompts sent and what rode beside them, the log.
+// meter. The world: a clock at 03:00Z, the meters as the test sets them, the agents at work, a hook
+// beneath the mod that drops the night's carry-ons when the test gives its reason (a settings hook's
+// block), the prompts sent and what rode beside them, the log.
 const T0 = Date.parse('2026-10-30T03:00:00Z')
 const MIN = 60_000
 const LOG = '/home/u/.claude/context-watch.log'
@@ -519,6 +520,7 @@ function night(on: On) {
     weekResets: '2026-10-31T12:00:00Z',
     agents: [] as unknown[],
     gate: undefined as Promise<void> | undefined,
+    drop: undefined as string | undefined,
   }
   const clock = mock.clock(on, { now: T0 })
   mock.env(on, { HOME: '/home/u', PWD: '/home/u/src/p' })
@@ -546,7 +548,10 @@ function night(on: On) {
   on('tool.call', async () => ({ result: 'ok' }) as never)
   on('ui.status', async () => ({ value: undefined }) as never)
   on('command.run', { command: 'clear' }, async () => (host.clear(), { text: '' }))
-  on('prompt.submit', async (_, e) => (sent.push(e.text), beside.push(...(e.context ?? [])), { text: e.text }))
+  on('prompt.submit', async (_, e) => {
+    if (g.drop !== undefined && e.text.startsWith('Carrying on the night')) return { drop: g.drop }
+    return (sent.push(e.text), beside.push(...(e.context ?? [])), { text: e.text })
+  })
   on('turn.start', async (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', async () => ({ text: '' }))
   // An API error that ends a turn: no settings hook of the user's answers it.
@@ -1036,6 +1041,32 @@ test('a resumed turn that makes no tool call pauses the night; one that works is
   await w.later(10 * MIN)
   expect(w.sent.length).toBe(2)
   expect(w.log()).toContain('the night paused: the resumed turn made no tool call')
+})
+
+// A carry-on another hook drops (a settings hook's block, another mod's refusal) still resolves the
+// submit, with the hook's reason: it is not taken. The same hook would drop the next one too, so the
+// night pauses, saying why, rather than trying again every 10 minutes into the log (T237).
+test("a carry-on a hook drops is not taken: the night pauses with the hook's reason and writes down no resume", async ($, on) => {
+  const w = night(on)
+  await setNight($)
+  w.g.drop = 'UserPromptSubmit hook blocked it:\n  quiet hours'
+  await turn($, 'Landed P1390.')
+  await w.later(2 * MIN)
+  expect(w.sent).toEqual([])
+  expect(w.log()).toContain('the night paused: the carry-on was dropped (UserPromptSubmit hook blocked it: ⏎ quiet hours)')
+  expect(w.log()).not.toContain('the night resumed the session')
+  const shown = (await cw($, 'night')).text ?? ''
+  expect(shown).toContain('paused: the carry-on was dropped (UserPromptSubmit hook blocked it: ⏎ quiet hours), until the next prompt')
+  expect(shown).toContain('resumes in the last hour: 0 of')
+  await w.later(30 * MIN)
+  expect(w.sent).toEqual([])
+  // The next prompt lifts the pause; once the hook lets it through, its turn's end resumes the night.
+  w.g.drop = undefined
+  await $.prompt.submit(notice('a task finished'))
+  await turn($, 'Read its report.', { text: 'a task finished' })
+  await w.later(2 * MIN)
+  expect(carryOns(w.sent).length).toBe(1)
+  expect(w.log()).toContain('the night resumed the session (1 in the last hour)')
 })
 
 test('eight resumes in an hour pause the night', async ($, on) => {

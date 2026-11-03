@@ -148,6 +148,7 @@ It pauses until the next prompt of any kind (a task's report lifts the pause) wh
 - a resumed turn makes no tool call;
 - there were eight resumes in the last hour (a loop);
 - the model refused;
+- the carry-on was dropped, by a hook (a settings hook's block, another mod's refusal) or by the engine (a host's limit): the next one would be too, so the night pauses, and the log and `/context-watch night` give the reason. A submit that fails outright is tried again ten minutes later. Neither counts as a resume;
 - a turn ended on an error that won't clear by itself, once a resume has failed in the run of errors. The kind is the engine's word for that turn's own error (a lapsed plan, a sign-in, billing, a request refused). Then nothing more is sent until a turn ends well: a report's turn that fails the same way pauses it again. An error that may clear (overloaded, a rate limit, a server error, a cut-off answer, or one the engine didn't name) backs off instead. The engine may name a turn's error only after the turn's end; the night decides then.
 
 Reaching the line is told to the model the way a limit is: land what's in flight, and start nothing new. A lower `limitweek` holds, and the night runs to that. The night is kept for the window through clears and reloads; a reload arms the waiting resume again. Each step is logged: set, resumed, waits, paused, ended.
